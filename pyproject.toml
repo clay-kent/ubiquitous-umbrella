@@ -1,0 +1,14 @@
+[project]
+name = "pbl2-second"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13.11"
+dependencies = [
+    "mypy>=2.1.0",
+    "networkx>=3.6.1",
+    "numpy>=2.5.0",
+    "shapely>=2.1.2",
+    "types-networkx>=3.6.1.20260612",
+    "types-shapely>=2.1.0.20260603",
+]
