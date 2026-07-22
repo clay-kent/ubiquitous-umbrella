@@ -212,13 +212,13 @@ def test_calculate_nets_invalid_sort_by():
     assert len(data["nets"]) == 11
 
 def test_calculate_nets_negative_dimensions():
-    # 負の寸法が渡された場合、現在 API は 200 OK を返すが、展開図が正しく作られず空になる
+    # 負の寸法や 0 が渡された場合、FastAPI のバリデーション (gt=0) により 422 Unprocessable Entity になる
     response = client.get("/api/net/calculate?w=-1&h=1&d=1")
-    assert response.status_code == 200
-    data = response.json()
-    assert "nets" in data
-    # 負の寸法では有効なレイアウトが構築できず、ユニークな展開図リストは空になる
-    assert len(data["nets"]) == 0
+    assert response.status_code == 422
+    
+    response2 = client.get("/api/net/calculate?w=0&h=1&d=1")
+    assert response2.status_code == 422
+
 
 
 @patch("api_server.fifth")

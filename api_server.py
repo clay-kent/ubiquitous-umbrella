@@ -64,9 +64,9 @@ def get_layout_parent_relation(
 
 @app.get("/api/net/calculate")
 def calculate_nets(
-    w: float = Query(..., description="幅 (width)"),
-    h: float = Query(..., description="高さ (height)"),
-    d: float = Query(..., description="奥行き (depth)"),
+    w: float = Query(..., gt=0, description="幅 (width)"),
+    h: float = Query(..., gt=0, description="高さ (height)"),
+    d: float = Query(..., gt=0, description="奥行き (depth)"),
     sort_by: Optional[str] = Query("area", description="ソート基準 (area または perimeter)")
 ):
     vertices, faces = make_cuboid(w, h, d)
@@ -176,9 +176,9 @@ def calculate_nets(
 
 @app.get("/api/net/stl")
 def get_stl(
-    w: float = Query(..., description="幅 (width)"),
-    h: float = Query(..., description="高さ (height)"),
-    d: float = Query(..., description="奥行き (depth)")
+    w: float = Query(..., gt=0, description="幅 (width)"),
+    h: float = Query(..., gt=0, description="高さ (height)"),
+    d: float = Query(..., gt=0, description="奥行き (depth)")
 ):
     # STLテキストデータの生成
     # 直方体は12個の三角形（各長方形面に2つの三角形）で表現される。
