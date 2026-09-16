@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+shapely
+numpy
+matplotlib
+networkx
+pytest
+httpx
