@@ -1,3 +1,5 @@
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 from shapely.geometry import Polygon
@@ -70,6 +72,8 @@ def main():
     nets = fifth.generate_unfolding_nets(vertices, faces)
 
     print(f"生成された一意な展開図の総数: {len(nets)}")
+
+    os.makedirs("cuboids", exist_ok=True)
 
     # 全ての展開図画像を保存
     for idx, net in enumerate(nets):
