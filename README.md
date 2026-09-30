@@ -59,6 +59,13 @@ uvicorn api_server:app --reload
 ```
 サーバー起動後、ブラウザで **`http://127.0.0.1:8000/docs`** にアクセスすると、インタラクティブなAPI仕様書（Swagger UI）から動作確認が可能です。
 
+ブラウザからのアクセスは、既定で `http://localhost` / `http://127.0.0.1` とポート `3000`、`5173`、およびローカルの `file://` ページ（Origin が `null`）を許可しています。本番や別ポートのフロントエンドを許可する場合は、起動前に Origin をカンマ区切りで指定してください。
+
+```powershell
+$env:CORS_ORIGINS = "http://localhost:3000,https://example.com"
+uvicorn api_server:app --reload
+```
+
 #### 提供API
 - **`GET /api/net/calculate`**: 展開図計算API
   - パラメータ: `w` (幅), `h` (高さ), `d` (奥行き), `sort_by` (`area` / `perimeter` - 外枠面積、外周長といった評価指標でソート)
