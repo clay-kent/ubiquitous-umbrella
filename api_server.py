@@ -1,12 +1,31 @@
+import os
 import sys
 import numpy as np
 import fifth
 from fastapi import FastAPI, Query
 from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
 from shapely.geometry import Polygon
 from typing import Optional, List, Dict, Any
 
 app = FastAPI(title="Cuboid Net Generator API")
+
+# 開発環境の既定値。公開環境では CORS_ORIGINS にフロントエンドの Origin を指定する。
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "null,http://localhost,http://127.0.0.1,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def make_cuboid(w: float, h: float, d: float) -> tuple[np.ndarray, list[list[int]]]:
     """与えられた寸法(w, h, d)の直方体の頂点と面リストを生成する。"""

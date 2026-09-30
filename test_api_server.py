@@ -8,6 +8,50 @@ from api_server import app, make_cuboid, get_face_name, get_layout_parent_relati
 
 client = TestClient(app, raise_server_exceptions=False)
 
+
+def test_cors_preflight_allows_local_web_app():
+    response = client.options(
+        "/api/net/stl",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert "GET" in response.headers["access-control-allow-methods"]
+
+
+def test_cors_header_is_added_to_api_response():
+    response = client.get(
+        "/api/net/stl?w=1&h=2&d=3",
+        headers={"Origin": "http://localhost:5173"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+
+
+def test_cors_allows_xampp_origin_without_port():
+    response = client.get(
+        "/api/net/stl?w=1&h=2&d=3",
+        headers={"Origin": "http://localhost"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost"
+
+
+def test_cors_allows_file_origin_for_local_development():
+    response = client.get(
+        "/api/net/stl?w=1&h=2&d=3",
+        headers={"Origin": "null"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "null"
+
 # ==========================================
 # 1. ユニットテスト (make_cuboid)
 # ==========================================
