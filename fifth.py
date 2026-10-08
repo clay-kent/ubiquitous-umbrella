@@ -1,49 +1,360 @@
-import itertools
+import io
 import sys
+from collections.abc import Iterable, Iterator
 
 import networkx as nx
 import numpy as np
+import shapely
 from shapely.geometry import Polygon
 
 
+class SolidError(ValueError):
+    """入力された立体が不正なときに投げられる。
+
+    message は人間向け（日本語）、code は機械可読な分類。HTTP エラーの
+    ``detail`` に載せるとき、クライアントは ``code`` で分岐して
+    ``message`` を表示に回せる。ValueError のサブクラスなので、
+    既存の ``except ValueError`` はそのまま機能する。
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def validate_solid(
+    vertices: np.ndarray, faces: list[list[int]], *, planarity_tol: float = 1e-6
+) -> None:
+    """入力された立体の妥当性を検査し、不正なら SolidError を投げる。"""
+    n_v = len(vertices)
+    n_f = len(faces)
+    if n_v < 4:
+        raise SolidError("too_few_vertices", "立体には4頂点以上が必要です。")
+    if n_f < 4:
+        raise SolidError("too_few_faces", "立体には4面以上が必要です。")
+
+    scale = float(np.max(np.abs(vertices))) or 1.0
+    for f_idx, face in enumerate(faces):
+        if len(face) < 3:
+            raise SolidError("face_too_few_vertices", f"面{f_idx} の頂点数が3未満です。")
+        if len(set(face)) != len(face):
+            raise SolidError(
+                "duplicate_face_vertex", f"面{f_idx} に同じ頂点が複数回含まれています。"
+            )
+        for v_idx in face:
+            if not 0 <= v_idx < n_v:
+                raise SolidError(
+                    "vertex_index_out_of_range",
+                    f"面{f_idx} の頂点インデックス {v_idx} が範囲外です。",
+                )
+
+        pts = vertices[face]
+        for i in range(len(face)):
+            if np.allclose(pts[i], pts[(i + 1) % len(face)], atol=1e-12):
+                raise SolidError("zero_length_edge", f"面{f_idx} に長さ0の辺があります。")
+
+        normal = face_normal(vertices, face)
+        offsets = (pts - pts[0]) @ normal
+        if float(np.max(np.abs(offsets))) > planarity_tol * scale:
+            raise SolidError("non_planar_face", f"面{f_idx} は平面ではありません。")
+
+    # 閉じた2多様体であること（各辺がちょうど2面に共有される）
+    for edge, holders in build_edge_map(faces).items():
+        if len(holders) != 2:
+            raise SolidError(
+                "boundary_or_non_manifold",
+                f"辺{edge} が{len(holders)}個の面に共有されています。"
+                "閉じていないか非多様体です。",
+            )
+
+    # 各頂点まわりの面が1つのサイクルをなすこと（面の飛び）を検出
+    for v_idx in range(n_v):
+        incident = [i for i, f in enumerate(faces) if v_idx in f]
+        if len(incident) < 3:
+            raise SolidError("vertex_underused", f"頂点{v_idx} を含む面が3未満です。")
+        link: dict[int, set[int]] = {i: set() for i in incident}
+        for f_idx in incident:
+            face = faces[f_idx]
+            pos = face.index(v_idx)
+            prev_v = face[pos - 1]
+            next_v = face[(pos + 1) % len(face)]
+            for other in incident:
+                if other == f_idx:
+                    continue
+                of = faces[other]
+                op = of.index(v_idx)
+                if of[op - 1] in (prev_v, next_v) or of[(op + 1) % len(of)] in (prev_v, next_v):
+                    link[f_idx].add(other)
+        seen = {incident[0]}
+        stack = [incident[0]]
+        while stack:
+            cur = stack.pop()
+            for nxt in link[cur]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        if len(seen) != len(incident):
+            raise SolidError(
+                "non_manifold_vertex", f"頂点{v_idx} まわりの面が連結ではありません（非多様体）。"
+            )
+
+
+def count_spanning_trees(edges: list[tuple[int, int]], num_nodes: int) -> int:
+    """隣接グラフの全域木の個数を Matrix-Tree 定理で求める（列挙せずに計算）。"""
+    if num_nodes <= 1:
+        return 1
+    lap = np.zeros((num_nodes - 1, num_nodes - 1))
+    for u, v in edges:
+        if u < num_nodes - 1:
+            lap[u, u] += 1
+        if v < num_nodes - 1:
+            lap[v, v] += 1
+        if u < num_nodes - 1 and v < num_nodes - 1:
+            lap[u, v] -= 1
+            lap[v, u] -= 1
+    return round(float(np.linalg.det(lap)))
+
+
+def build_edge_map(faces: list[list[int]]) -> dict[tuple[int, int], list[tuple[int, int]]]:
+    """無向辺 -> [(その辺を含む面インデックス, 進行方向)] を構築する。
+
+    進行方向は面のループがその辺を (min, max) の順に通れば +1、逆なら -1。
+    「2頂点を共有する」のではなく「辺を共有する」で隣接を判定するための土台。
+    """
+    edge_map: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for f_idx, face in enumerate(faces):
+        n = len(face)
+        for i in range(n):
+            a, b = face[i], face[(i + 1) % n]
+            key = (a, b) if a < b else (b, a)
+            direction = 1 if a < b else -1
+            edge_map.setdefault(key, []).append((f_idx, direction))
+    return edge_map
+
+
+def build_adjacency_with_edges(
+    faces: list[list[int]],
+) -> list[tuple[int, int, tuple[int, int]]]:
+    """面の隣接を (面u, 面v, 共有辺) のリストで返す。"""
+    result = []
+    for edge, holders in build_edge_map(faces).items():
+        if len(holders) == 2:
+            (u, _), (v, _) = holders
+            result.append((u, v, edge))
+    return result
+
+
 def build_adjacency_graph(faces: list[list[int]]) -> list[tuple[int, int]]:
-    """面の隣接グラフの辺リストを構築する。"""
-    edges = []
-    n_faces = len(faces)
-    for i in range(n_faces):
-        for j in range(i + 1, n_faces):
-            if len(set(faces[i]) & set(faces[j])) == 2:
-                edges.append((i, j))
-    return edges
+    """面の隣接グラフの辺リスト（(面u, 面v)）を構築する。"""
+    return [(u, v) for u, v, _ in build_adjacency_with_edges(faces)]
+
+
+def _is_connected(cur: list[tuple[int, int]], num_nodes: int) -> bool:
+    """辺集合が全 num_nodes 頂点を連結にするかを BFS で調べる。"""
+    nbrs: list[list[int]] = [[] for _ in range(num_nodes)]
+    for a, b in cur:
+        nbrs[a].append(b)
+        nbrs[b].append(a)
+    seen = {0}
+    stack = [0]
+    while stack:
+        c = stack.pop()
+        for w in nbrs[c]:
+            if w not in seen:
+                seen.add(w)
+                stack.append(w)
+    return len(seen) == num_nodes
 
 
 def enumerate_spanning_trees(
     edges: list[tuple[int, int]], num_nodes: int
-) -> list[list[tuple[int, int]]]:
-    """すべての全域木を列挙する。"""
-    all_trees = []
-    for edge_subset in itertools.combinations(edges, num_nodes - 1):
-        g = nx.Graph()
-        g.add_nodes_from(range(num_nodes))
-        g.add_edges_from(edge_subset)
-        if nx.is_tree(g):
-            all_trees.append(list(edge_subset))
-    return all_trees
+) -> Iterator[list[tuple[int, int]]]:
+    """すべての全域木を、1つずつ返す（ジェネレータ）。
+
+    辺の部分集合を全部試す方法では C(E, V-1) 回の組み合わせ判定が必要になり、
+    面数の多い立体では列挙だけで時間がかかりすぎる。
+    ここでは辺の「削除・縮約」による分割統治を使う。
+
+        τ(G) = τ(G - e)  ⊎  { T ∪ {e} : T ∈ τ(G / e) }
+
+    と分解することで、探索する木の個数がちょうど τ(G) 個に収まる。
+    出力する辺は入力順（位置）に昇順に並べる。
+    """
+    if num_nodes <= 0:
+        return
+    if num_nodes == 1:
+        yield []
+        return
+
+    # 自己ループは全域木に含まれ得ないので除く。多重辺は別の辺なので残す。
+    # (元の辺番号, u, v) の組で持つ。縮約しても元の番号を失わないため。
+    base = [(i, u, v) for i, (u, v) in enumerate(edges) if u != v]
+    endpoints = {i: (u, v) for i, u, v in base}
+    if not _is_connected([(u, v) for _, u, v in base], num_nodes):
+        return
+
+    def rec(
+        cur: list[tuple[int, int, int]],
+        n: int,
+        chosen: list[int],
+    ) -> Iterator[list[tuple[int, int]]]:
+        """cur の全域木を列挙する。chosen はこの木に含めた辺の元の番号。"""
+        # 全域木に使え得る辺を1本選ぶ（ループは使わない）
+        pivot = -1
+        for i, (_, a, b) in enumerate(cur):
+            if a != b:
+                pivot = i
+                break
+        if pivot < 0:
+            if n == 1:  # 使える辺が尽き、頂点が1つなら全域木が完成している
+                # 端点は元の辺定義から取り出すので、縮約の過程に影響されない
+                yield [endpoints[i] for i in sorted(chosen)]
+            return
+
+        orig, pu, pv = cur[pivot]
+        rest = cur[:pivot] + cur[pivot + 1:]
+
+        # (1) pivot を使わない全域木
+        if _is_connected([(a, b) for _, a, b in rest], n):
+            yield from rec(rest, n, chosen)
+
+        # (2) pivot を使う全域木：pivot の両端を縮約して、縮約後の全域木に対応させる
+        # 縮約後の頂点数は n-1 個。n-2 が pu と pv の統合先、残りの番号を詰める。
+        merged = n - 2
+
+        def remap(x: int) -> int:
+            if x == pu or x == pv:
+                return merged
+            # pu・pv を除いた中の順位に詰め直す（pu と pv の大小は問わない）
+            return x - (pu < x) - (pv < x)
+
+        contracted = [(i, remap(a), remap(b)) for i, a, b in rest]
+        yield from rec(contracted, n - 1, chosen + [orig])
+
+    yield from rec(base, num_nodes, [])
+
+
+def face_normal(vertices: np.ndarray, face: list[int]) -> np.ndarray:
+    """1つの面の法線を Newell の方法で計算する。
+
+    先頭3頂点の外積ではなく面全体のループを使うため、
+    凹角 N-gon や先頭3頂点が一直線状の面でも正しく計算できる。
+    """
+    acc = np.zeros(3)
+    m = len(face)
+    for i in range(m):
+        a = vertices[face[i]]
+        b = vertices[face[(i + 1) % m]]
+        acc[0] += (a[1] - b[1]) * (a[2] + b[2])
+        acc[1] += (a[2] - b[2]) * (a[0] + b[0])
+        acc[2] += (a[0] - b[0]) * (a[1] + b[1])
+    norm = np.linalg.norm(acc)
+    if norm < 1e-12:
+        raise SolidError("degenerate_face", "退化した面（面積ゼロ）が検出されました。")
+    return acc / norm
 
 
 def compute_normals(vertices: np.ndarray, faces: list[list[int]]) -> list[np.ndarray]:
-    """各面の外向き法線ベクトルを計算する。"""
-    normals = []
+    """各面の法線ベクトルを計算する。
+
+    面の向きが入力に依存しないよう、build_adjacency_graph と組み合わせて
+    巻き順を統一してから外向き法線を返す。
+    """
+    return [face_normal(vertices, f) for f in orient_faces_outward(vertices, faces)]
+
+
+def signed_volume(vertices: np.ndarray, faces: list[list[int]]) -> float:
+    """発散定理で符号付き体積を求める。巻き順が正しければ正の値になる。"""
+    total = 0.0
     for face in faces:
-        p0 = vertices[face[0]]
-        p1 = vertices[face[1]]
-        p2 = vertices[face[2]]
-        n = np.cross(p1 - p0, p2 - p1)
-        norm = np.linalg.norm(n)
-        if norm < 1e-9:
-            raise ValueError("退化した面（面積ゼロ）が検出されました。")
-        normals.append(n / norm)
-    return normals
+        m = len(face)
+        for i in range(1, m - 1):
+            a, b, c = vertices[face[0]], vertices[face[i]], vertices[face[i + 1]]
+            total += float(np.dot(a, np.cross(b, c)))
+    return total / 6.0
+
+
+def orient_faces_outward(
+    vertices: np.ndarray, faces: list[list[int]]
+) -> list[list[int]]:
+    """面の巻き順を「外向き・互いに整合」に正規化して返す。
+
+    呼び出し側が巻き順（Hole の向き）を意識しなくて済むようにする。
+    非可向きの立体は ValueError。
+    """
+    oriented = [list(f) for f in faces]
+    edge_map = build_edge_map(faces)
+
+    # 1) 各辺を2つの面が逆向きに通るようにする（整合性の強制）
+    #    parity union-find で「どちらかの面を裏返す必要がある」制約を解く
+    parent: dict[int, int] = {i: i for i in range(len(faces))}
+    parity: dict[int, int] = {i: 0 for i in range(len(faces))}
+
+    def find(x: int) -> tuple[int, int]:
+        if parent[x] != x:
+            p = parent[x]
+            root, q = find(p)
+            parent[x] = root
+            parity[x] ^= q
+        return parent[x], parity[x]
+
+    for holders in edge_map.values():
+        if len(holders) != 2:
+            continue
+        (f1, d1), (f2, d2) = holders
+        # 両面が同じ向きに通っているなら、ちょうど片方を裏返す必要がある
+        need_flip = 1 if d1 == d2 else 0
+        r1, p1 = find(f1)
+        r2, p2 = find(f2)
+        if r1 == r2:
+            if (p1 ^ p2) != need_flip:
+                raise SolidError("non_orientable", "非可向きの立体です（面の整合性を解消できません）。")
+        else:
+            parent[r1] = r2
+            parity[r1] = p1 ^ p2 ^ need_flip
+
+    for i in range(len(faces)):
+        find(i)  # 経路圧縮して parity を根に対して確定させる
+    for i in range(len(faces)):
+        if parity[i]:
+            oriented[i] = list(reversed(faces[i]))
+
+    # 2) 全体を裏返して外向きにする
+    if signed_volume(vertices, oriented) < 0:
+        oriented = [list(reversed(f)) for f in oriented]
+
+    return oriented
+
+
+def prepare_layout(
+    vertices: np.ndarray, faces: list[list[int]], normals: list[np.ndarray]
+) -> dict:
+    """layout_tree の呼び出しごとに変わらない前計算をまとめる。
+
+    全域木1つにつき1回しか使わない値だが、候補が数千本あるため先にまとめておく。
+    """
+    shared_of: dict[tuple[int, int], tuple[int, int]] = {}
+    for u, v, edge in build_adjacency_with_edges(faces):
+        shared_of[(u, v)] = edge
+        shared_of[(v, u)] = edge
+
+    origin = vertices[faces[0][0]]
+    u_x = vertices[faces[0][1]] - origin
+    u_x = u_x / np.linalg.norm(u_x)
+    nx_, ny_, nz_ = normals[0].tolist()
+    ux, uy, uz = u_x.tolist()
+    u_y = np.array([ny_ * uz - nz_ * uy, nz_ * ux - nx_ * uz, nx_ * uy - ny_ * ux])
+
+    return {
+        "shared_of": shared_of,
+        "origin": origin,
+        "u_x": u_x,
+        "u_y": u_y,
+        # 面の3D座標も変わらないので、毎回の多少次索引を避ける
+        "face_pts": [vertices[f] for f in faces],
+        # 全面の頂点数が同じなら、まとめて Polygon を作れる
+        "uniform_ring": len({len(f) for f in faces}) == 1,
+    }
 
 
 def layout_tree(
@@ -51,110 +362,108 @@ def layout_tree(
     faces: list[list[int]],
     normals: list[np.ndarray],
     tree_edges: list[tuple[int, int]],
+    precomputed: dict | None = None,
 ) -> list[Polygon]:
-    """全域木に基づいて面を展開し、ShapelyのPolygonリスト（2D座標系）を返す。"""
+    """全域木に基づいて面を展開し、ShapelyのPolygonリスト（2D座標系）を返す。
+
+    平行移動・回転は 4x4 行列ではなく (回転行列 R, 移動ベクトル t) で持ち、
+    最終的な 2D への投影もまとめてベクトル演算する。
+    全域木の数だけ呼び出されるため、ここは定数倍でも効く。
+    """
+    if precomputed is None:
+        precomputed = prepare_layout(vertices, faces, normals)
+    shared_of = precomputed["shared_of"]
     n_faces = len(faces)
-    adj = [[] for _ in range(n_faces)]
+
+    adj: list[list[int]] = [[] for _ in range(n_faces)]
     for u, v in tree_edges:
         adj[u].append(v)
         adj[v].append(u)
 
-    m_matrices = [None] * n_faces
-    m_matrices[0] = np.eye(4)
+    rot: list[np.ndarray | None] = [None] * n_faces
+    off: list[np.ndarray | None] = [None] * n_faces
+    rot[0] = np.eye(3)
+    off[0] = np.zeros(3)
+
     queue = [0]
-    visited = {0}
-
-    while queue:
-        u = queue.pop(0)
+    for u in queue:
         for v in adj[u]:
-            if v in visited:
+            if rot[v] is not None:
+                continue
+            edge = shared_of.get((u, v))
+            if edge is None:
                 continue
 
-            shared = set(faces[u]) & set(faces[v])
-            n_u = len(faces[u])
-            a_idx, b_idx = None, None
-            for i in range(n_u):
-                if faces[u][i] in shared and faces[u][(i + 1) % n_u] in shared:
-                    a_idx = faces[u][i]
-                    b_idx = faces[u][(i + 1) % n_u]
-                    break
+            p_a = vertices[edge[0]]
+            p_b = vertices[edge[1]]
+            k = (p_b - p_a) / np.linalg.norm(p_b - p_a)
+            kx, ky, kz = k.tolist()
+            nx_, ny_, nz_ = normals[u].tolist()
+            mx, my, mz = normals[v].tolist()
 
-            if a_idx is None or b_idx is None:
-                continue
-
-            p_a = vertices[a_idx]
-            p_b = vertices[b_idx]
-
-            edge_vec = p_b - p_a
-            k = edge_vec / np.linalg.norm(edge_vec)
-
-            nu = normals[u]
-            nv = normals[v]
-            c = np.dot(nv, nu)
-            s = np.dot(np.cross(k, nv), nu)
-
-            kx, ky, kz = k
-            v_1c = 1 - c
-            r_rot = np.array(
+            c = mx * nx_ + my * ny_ + mz * nz_
+            # s = dot(cross(k, n_v), n_u) （np.cross は微小配列では極端に遅い）
+            s = (
+                (ky * mz - kz * my) * nx_
+                + (kz * mx - kx * mz) * ny_
+                + (kx * my - ky * mx) * nz_
+            )
+            v1c = 1.0 - c
+            r = np.array(
                 [
-                    [
-                        kx * kx * v_1c + c,
-                        kx * ky * v_1c - kz * s,
-                        kx * kz * v_1c + ky * s,
-                        0,
-                    ],
-                    [
-                        ky * kx * v_1c + kz * s,
-                        ky * ky * v_1c + c,
-                        ky * kz * v_1c - kx * s,
-                        0,
-                    ],
-                    [
-                        kz * kx * v_1c - ky * s,
-                        kz * ky * v_1c + kx * s,
-                        kz * kz * v_1c + c,
-                        0,
-                    ],
-                    [0, 0, 0, 1],
+                    [kx * kx * v1c + c, kx * ky * v1c - kz * s, kx * kz * v1c + ky * s],
+                    [ky * kx * v1c + kz * s, ky * ky * v1c + c, ky * kz * v1c - kx * s],
+                    [kz * kx * v1c - ky * s, kz * ky * v1c + kx * s, kz * kz * v1c + c],
                 ]
             )
 
-            t1 = np.eye(4)
-            t1[0:3, 3] = -p_a
-            t2 = np.eye(4)
-            t2[0:3, 3] = p_a
-            transform = t2 @ r_rot @ t1
-
-            m_matrices[v] = m_matrices[u] @ transform
-            visited.add(v)
+            rot[v] = rot[u] @ r
+            off[v] = rot[u] @ (p_a - r @ p_a) + off[u]
             queue.append(v)
 
-    origin = vertices[faces[0][0]]
-    u_x = vertices[faces[0][1]] - origin
-    u_x = u_x / np.linalg.norm(u_x)
-    u_z = normals[0]
-    u_y = np.cross(u_z, u_x)
+    origin = precomputed["origin"]
+    u_x = precomputed["u_x"]
+    u_y = precomputed["u_y"]
+    face_pts = precomputed["face_pts"]
 
-    polygons = []
+    coords = []
     for i in range(n_faces):
-        pts_2d = []
-        for v_idx in faces[i]:
-            p3d_h = np.append(vertices[v_idx], 1.0)
-            p_trans = (m_matrices[i] @ p3d_h)[:3]
+        face_rot, t = rot[i], off[i]
+        if face_rot is None:
+            raise ValueError(f"面{i} へ到達できませんでした（全域木が不正です）。")
+        # p_trans = r @ p + t を、2D 投影に代入してまとめて計算する
+        axis_x = face_rot.T @ u_x
+        axis_y = face_rot.T @ u_y
+        shift = t - origin
+        pts = face_pts[i]
+        coords_x = pts @ axis_x + float(shift @ u_x)
+        coords_y = pts @ axis_y + float(shift @ u_y)
+        coords.append(np.column_stack([coords_x, coords_y]))
 
-            x2d = np.dot(p_trans - origin, u_x)
-            y2d = np.dot(p_trans - origin, u_y)
-            pts_2d.append((x2d, y2d))
-        polygons.append(Polygon(pts_2d))
+    if precomputed["uniform_ring"]:
+        # 頂点数が揃っていればまとめて作ると Polygon() を1つずつ呼ぶより速い
+        rings = shapely.polygons(shapely.linearrings(np.stack(coords)))
+        if isinstance(rings, Polygon):
+            return [rings]
+        return list(rings)
+    return [Polygon(c) for c in coords]
 
-    return polygons
 
+def is_valid_layout(polygons) -> bool:
+    """展開図のポリゴン間に重なり（衝突）がないかを検証する。
 
-def is_valid_layout(polygons: list[Polygon]) -> bool:
-    """展開図のポリゴン間に重なり（衝突）がないかを検証する。"""
+    外面の数が少ないので、空間索引（STRtree）よりも外接矩形で絞り込んだほうが
+    intersection を呼ぶ回数が減って速い。
+    """
     n_polys = len(polygons)
+    bounds = [p.bounds for p in polygons]
     for i in range(n_polys):
+        ax0, ay0, ax1, ay1 = bounds[i]
         for j in range(i + 1, n_polys):
+            bx0, by0, bx1, by1 = bounds[j]
+            # 外接矩形が重ならなければ交差面積も 0 なので交差計算を省略できる
+            if ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0:
+                continue
             if polygons[i].intersection(polygons[j]).area > 1e-4:
                 return False
     return True
@@ -174,7 +483,7 @@ def build_ribbon_graph(
       - 'glue' 型の無向/双方向有向エッジ: 隣接面間の接着
         - 属性 `flipped`: 接着される向き
     """
-    g = nx.DiGraph()
+    g: nx.DiGraph = nx.DiGraph()
 
     # 1. ハーフエッジのノードを作成し、面内の「next」エッジで巡回的に結ぶ
     for f_idx, face in enumerate(faces):
@@ -183,7 +492,7 @@ def build_ribbon_graph(
             p1 = vertices[face[i]]
             p2 = vertices[face[(i + 1) % n_v]]
             length = np.linalg.norm(p2 - p1)
-            
+
             node_id = (f_idx, i)
             g.add_node(node_id, length=round(length, 5))
 
@@ -197,7 +506,7 @@ def build_ribbon_graph(
         shared = set(faces[u]) & set(faces[v])
         if len(shared) != 2:
             continue
-        
+
         # 面uにおける共有辺のインデックスを探す
         idx_u = None
         n_u = len(faces[u])
@@ -206,7 +515,7 @@ def build_ribbon_graph(
             if a in shared and b in shared:
                 idx_u = i
                 break
-        
+
         # 面vにおける共有辺のインデックスを探す
         idx_v = None
         n_v = len(faces[v])
@@ -220,9 +529,9 @@ def build_ribbon_graph(
             # glueエッジを双方向で接続
             u_start, u_end = faces[u][idx_u], faces[u][(idx_u + 1) % n_u]
             v_start, v_end = faces[v][idx_v], faces[v][(idx_v + 1) % n_v]
-            
+
             flipped = (u_start == v_end) and (u_end == v_start)
-            
+
             g.add_edge((u, idx_u), (v, idx_v), type="glue", flipped=flipped)
             g.add_edge((v, idx_v), (u, idx_u), type="glue", flipped=flipped)
 
@@ -232,8 +541,10 @@ def build_ribbon_graph(
 def is_isomorphic_net(g1: nx.DiGraph, g2: nx.DiGraph) -> bool:
     """2つの半辺グラフが同型であるかを判定する。"""
     def node_match(n1, n2):
-        # 辺の長さが一致するかチェック
-        return abs(n1["length"] - n2["length"]) < 1e-4
+        # build_ribbon_graph は round(length, 5) で丸めた値を格納している。
+        # _ribbon_invariant も同じ丸めを使うので、両者を完全一致で比較することで
+        # 不変量だけが別になるケースを防げるよう、両者の丸めを揃える。
+        return n1["length"] == n2["length"]
 
     def edge_match(e1, e2):
         # エッジのタイプ (next or glue) と flipped 属性が一致するかチェック
@@ -249,9 +560,191 @@ def is_isomorphic_net(g1: nx.DiGraph, g2: nx.DiGraph) -> bool:
     return GM.is_isomorphic()
 
 
+class RibbonContext:
+    """半辺構造の前計算結果。全域木ごとに変わらないので一度だけ作る。"""
+
+    __slots__ = (
+        "edge_len",
+        "faces",
+        "idx_map",
+        "n_faces",
+        "n_nodes",
+        "node_id",
+        "nxt",
+        "shared",
+        "vertices",
+    )
+
+    def __init__(self, vertices: np.ndarray, faces: list[list[int]]):
+        self.vertices = vertices
+        self.faces = faces
+        self.n_faces = len(faces)
+
+        nodes: list[tuple[int, int]] = []
+        nxt: list[int] = []
+        edge_len: list[float] = []
+        node_id: list[list[int]] = []
+        idx_map: list[dict[frozenset[int], int]] = []
+        for f_idx, face in enumerate(faces):
+            k = len(face)
+            base = len(nodes)
+            m: dict[frozenset[int], int] = {}
+            row: list[int] = []
+            for i in range(k):
+                m.setdefault(frozenset((face[i], face[(i + 1) % k])), i)
+                row.append(base + i)
+                nodes.append((f_idx, i))
+                edge_len.append(
+                    round(
+                        float(
+                            np.linalg.norm(
+                                vertices[face[i]] - vertices[face[(i + 1) % k]]
+                            )
+                        ),
+                        5,
+                    )
+                )
+            for i in range(k):
+                nxt.append(row[(i + 1) % k])
+            node_id.append(row)
+            idx_map.append(m)
+
+        self.n_nodes = len(nodes)
+        self.nxt = nxt
+        self.edge_len = edge_len
+        self.idx_map = idx_map
+        self.node_id = node_id
+
+        shared: dict[tuple[int, int], frozenset[int]] = {}
+        for u, v, edge in build_adjacency_with_edges(faces):
+            key = frozenset(edge)
+            shared[(u, v)] = key
+            shared[(v, u)] = key
+        self.shared = shared
+
+
+def _glue_arrays(
+    ctx: RibbonContext, tree_edges: list[tuple[int, int]]
+) -> tuple[list[int], list[bool]]:
+    """半辺の「接着相手」と「接着の向き」を求める。
+
+    glue は build_ribbon_graph が双方向に張るので、is_isomorphic_net から見れば
+    無向辺になっている。ここでは向きを区別せず「接着相手」として扱う。
+    """
+    faces = ctx.faces
+    n_nodes = ctx.n_nodes
+    partner = [-1] * n_nodes
+    flip = [False] * n_nodes
+
+    for u, v in tree_edges:
+        edge = ctx.shared.get((u, v))
+        if edge is None:
+            continue
+        iu = ctx.idx_map[u][edge]
+        iv = ctx.idx_map[v][edge]
+        nu = ctx.node_id[u][iu]
+        nv = ctx.node_id[v][iv]
+        fu, fv = faces[u], faces[v]
+        ku, kv = len(fu), len(fv)
+        fl = fu[iu] == fv[(iv + 1) % kv] and fu[(iu + 1) % ku] == fv[iv]
+        partner[nu] = nv
+        partner[nv] = nu
+        flip[nu] = fl
+        flip[nv] = fl
+
+    return partner, flip
+
+
+def _wl_refine(nxt: list[int], partner: list[int], flip: list[bool], color: list) -> list:
+    """色細分（1-WL）。分割が安定するまで繰り返す。
+
+    細分化しか起きないため「色数が変わらなくなった」時点で安定している。
+    """
+    n = len(nxt)
+    while True:
+        new = [
+            hash(
+                (
+                    color[i],
+                    color[nxt[i]],
+                    None if partner[i] < 0 else (flip[i], color[partner[i]]),
+                )
+            )
+            for i in range(n)
+        ]
+        if len(set(new)) == len(set(color)):
+            return new
+        color = new
+
+
+def _individualize_refine(
+    nxt: list[int],
+    partner: list[int],
+    flip: list[bool],
+    color: list,
+    budget: list[int],
+) -> tuple | None:
+    """個別化-細分による正規形。予算超過なら None（呼び出し側は VF2 にフォールバック）。"""
+    n = len(nxt)
+    if budget[0] > 200_000:
+        return None
+    budget[0] += n
+
+    color = _wl_refine(nxt, partner, flip, color)
+    if len(set(color)) == n:
+        # 全ての半辺が別々の色になった = 色列そのものが完全な同型判定になる
+        return tuple(sorted(color))
+
+    cells: dict = {}
+    for i, c in enumerate(color):
+        cells.setdefault(c, []).append(i)
+    multi = {c: members for c, members in cells.items() if len(members) > 1}
+    if not multi:
+        return tuple(sorted(color))
+
+    # 色の値が最小のセルを1つ選んで個別化する（この選択は同型で変わらない）
+    target = min(multi)
+    best: tuple | None = None
+    for v in multi[target]:
+        branch = list(color)
+        branch[v] = min(color) - 1  # 既存の色と衝突しない新しい色
+        got = _individualize_refine(nxt, partner, flip, branch, budget)
+        if got is None:
+            return None
+        if best is None or got < best:
+            best = got
+    return best
+
+
+def _ribbon_invariant(ctx: RibbonContext, tree_edges: list[tuple[int, int]]) -> tuple:
+    """半辺構造の同型不変量（Weisfeiler-Lehman 色の細分のみ）。
+
+    同型な半辺グラフは必ず同じ不変量を持つ（分離は起きない）。
+    ただし別々の展開図が同じ不変量になることもあるため、
+    この値だけで同一とは判定せず is_isomorphic_net を併用する。
+    """
+    partner, flip = _glue_arrays(ctx, tree_edges)
+    color = [(ctx.edge_len[i], partner[i] >= 0, flip[i]) for i in range(ctx.n_nodes)]
+    return tuple(sorted(_wl_refine(ctx.nxt, partner, flip, color)))
+
+
+def _net_signature(
+    ctx: RibbonContext, tree_edges: list[tuple[int, int]]
+) -> tuple | None:
+    """展開図の正規形（同型なら必ず一致するキー）。
+
+    個別化-細分が全ての半辺を区別できた場合、その色は完全な同型判定になる。
+    予算超過で失敗したときだけ None を返し、VF2 に任せる。
+    """
+    partner, flip = _glue_arrays(ctx, tree_edges)
+    color = [(ctx.edge_len[i], partner[i] >= 0, flip[i]) for i in range(ctx.n_nodes)]
+    return _individualize_refine(ctx.nxt, partner, flip, color, [0])
+
+
+
 def reverse_ribbon_graph(g: nx.DiGraph) -> nx.DiGraph:
     """ハーフエッジグラフの面内有向エッジ(next)をすべて反転させた、鏡像（裏返し）グラフを生成する。"""
-    rev_g = nx.DiGraph()
+    rev_g: nx.DiGraph = nx.DiGraph()
     for node, data in g.nodes(data=True):
         rev_g.add_node(node, **data)
     for u, v, data in g.edges(data=True):
@@ -262,40 +755,97 @@ def reverse_ribbon_graph(g: nx.DiGraph) -> nx.DiGraph:
     return rev_g
 
 
-def get_unique_nets_by_ribbon_graph(
+def iter_unique_nets(
     vertices: np.ndarray,
     faces: list[list[int]],
-    all_trees: list[list[tuple[int, int]]],
+    all_trees: Iterable[list[tuple[int, int]]],
     normals: list[np.ndarray],
-) -> list[list[tuple[int, int]]]:
-    """半辺グラフの同型判定を用いて、一意な展開図に対応する全域木を抽出する。"""
-    unique_trees = []
-    unique_graphs = []
-    unique_graphs_rev = []
+) -> Iterator[tuple[list[tuple[int, int]], list[Polygon]]]:
+    """一意な展開図を (全域木, 2Dポリゴン) の組として順に返す。
+
+    2段構えで重複を潰す:
+
+    1. _net_signature（個別化-細分の正規形）だけで一意に決まるものはハッシュで潰す。
+       正規形は同型なら必ず一致し、通常の展開図ではこれだけで完毕する。
+    2. 正規形を予算超過で出せなかった場合だけ、Weisfeiler-Lehman 不変量で
+       バケット分割し、その中でのみ実際の VF2 同型判定（is_isomorphic_net）を行う。
+
+    どちらの段も「同型なら必ず同じバケット」という保証しか持たないため、
+    最終的な正しさは is_isomorphic_net に担保させている。
+    """
+    ctx = RibbonContext(vertices, faces)
+    mirror_ctx = RibbonContext(vertices, [list(reversed(f)) for f in faces])
+    layout_prep = prepare_layout(vertices, faces, normals)
+
+    exact_seen: set[tuple] = set()
+    buckets: dict[tuple, list[tuple]] = {}
+    graph_cache: dict[tuple, tuple[nx.DiGraph, nx.DiGraph]] = {}
+
+    def graph_pair(tree: list[tuple[int, int]]) -> tuple[nx.DiGraph, nx.DiGraph]:
+        """半辺グラフとその鏡像を作る（同一木の再計算を避けるためキャッシュ）。"""
+        key = tuple(tree)
+        cached = graph_cache.get(key)
+        if cached is None:
+            rg = build_ribbon_graph(vertices, faces, tree)
+            cached = (rg, reverse_ribbon_graph(rg))
+            graph_cache[key] = cached
+        return cached
 
     for tree in all_trees:
         try:
-            polys = layout_tree(vertices, faces, normals, tree)
+            # レイアウトより先に重複を判定する。
+            # 全域木の多くは別の木に既に含まれる重複なので、ここで弾けるほど
+            # 展開と重なり判定の回数が減る（実測で全体の約7割を占めていた）。
+            # 同じ正規形の木は展開図が合同であり重なり判定の結果まで一致する
+            # （test_unique_nets_geometry.py で独立に検証済み）ため、順序を入れ替えても
+            # 返り値は変わらない。
+            sig = _net_signature(ctx, tree)
+            mirror_sig = _net_signature(mirror_ctx, tree)
+
+            if sig is not None and mirror_sig is not None:
+                # 鏡像は同一視するので、自身と鏡像の正規形の小さい方をキーにする。
+                # キーを先に登録してあるので、同型な木は展開せずに弾ける。
+                key = min(sig, mirror_sig)
+                if key in exact_seen:
+                    continue
+                exact_seen.add(key)
+                polys = layout_tree(vertices, faces, normals, tree, layout_prep)
+                if not is_valid_layout(polys):
+                    continue
+                yield tree, polys
+                continue
+
+            inv = _ribbon_invariant(ctx, tree)
+            mirror_inv = _ribbon_invariant(mirror_ctx, tree)
+            bucket = buckets.setdefault(min(inv, mirror_inv), [])
+
+            if bucket:
+                rg, _ = graph_pair(tree)
+                is_duplicate = any(
+                    is_isomorphic_net(rg, other) or is_isomorphic_net(rg, other_rev)
+                    for other, other_rev in (graph_pair(list(t)) for t in bucket)
+                )
+                if is_duplicate:
+                    continue
+
+            polys = layout_tree(vertices, faces, normals, tree, layout_prep)
             if not is_valid_layout(polys):
                 continue
-            
-            rg = build_ribbon_graph(vertices, faces, tree)
-            
-            # 既存のユニークなグラフ（およびその鏡像）と同型かチェック
-            is_duplicate = False
-            for u_g, u_g_rev in zip(unique_graphs, unique_graphs_rev):
-                if is_isomorphic_net(rg, u_g) or is_isomorphic_net(rg, u_g_rev):
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                unique_graphs.append(rg)
-                unique_graphs_rev.append(reverse_ribbon_graph(rg))
-                unique_trees.append(tree)
-        except Exception as e:
+            bucket.append(tuple(tree))
+            yield tree, polys
+        except ValueError:
+            # 展開できない木（退化した面など）は静かに捨てる
             continue
 
-    return unique_trees
+
+def get_unique_nets_by_ribbon_graph(
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    all_trees: Iterable[list[tuple[int, int]]],
+    normals: list[np.ndarray],
+) -> list[list[tuple[int, int]]]:
+    """一意な展開図に対応する全域木を抽出する（iter_unique_nets の簡易ラッパ）。"""
+    return [tree for tree, _ in iter_unique_nets(vertices, faces, all_trees, normals)]
 
 
 def generate_unfolding_nets(
@@ -306,25 +856,19 @@ def generate_unfolding_nets(
     n_faces = len(faces)
 
     if n_faces < 4:
-        raise ValueError("多面体は少なくとも4つ以上の面を持つ必要があります。")
+        raise SolidError("too_few_faces", "多面体は少なくとも4つ以上の面を持つ必要があります。")
 
     edges = build_adjacency_graph(faces)
     all_trees = enumerate_spanning_trees(edges, n_faces)
     normals = compute_normals(vertices, faces)
 
-    unique_trees = get_unique_nets_by_ribbon_graph(vertices, faces, all_trees, normals)
-
-    valid_nets = []
-    for tree in unique_trees:
-        polys = layout_tree(vertices, faces, normals, tree)
-        valid_nets.append(polys)
-
-    return valid_nets
+    return [polys for _, polys in iter_unique_nets(vertices, faces, all_trees, normals)]
 
 
 if __name__ == "__main__":
     # 出力をUTF-8に変更 (Windows/CP932環境での文字化け対策)
-    sys.stdout.reconfigure(encoding="utf-8")
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8")
 
     # --- 1. 立方体 ---
     cube_vertices = np.array(

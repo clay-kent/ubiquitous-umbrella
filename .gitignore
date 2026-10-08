@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 cuboids/**
+nets/**
 
 # Virtual environments
 .venv
