@@ -529,6 +529,106 @@ def test_is_valid_layout_rejects_partial_overlap():
     assert not fifth.is_valid_layout([a, b])
 
 
+def _old_bbox_perimeter(polys):
+    """削除した CLI 側の周長定義 ``2*(w+h)``（外接矩形の周長）。
+
+    旧実装は ``poly.exterior.xy`` から x と y を分けて集めていた。
+    shapely 2.x の ``coords[0]`` は「最初の座標」であって x の配列では
+    ないので、ここでは明示的に分解する。
+    """
+    xs = [x for p in polys for x, _ in p.exterior.coords]
+    ys = [y for p in polys for _, y in p.exterior.coords]
+    return 2.0 * ((max(xs) - min(xs)) + (max(ys) - min(ys)))
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [cube_b, tetrahedron_b, prism4_b, prism5_b, l_shape_b],
+    ids=["cube", "tetra", "prism4", "prism5", "L-shape"],
+)
+def test_perimeter_equals_face_sum_minus_folded_edges(builder):
+    """外周長 = 全面の周長合計 − 2 × 折り曲げ軸の長さ合計。
+
+    展開図の外周は「折ったときに内側になる棱」だけ短くなる。定義どおりの
+    値が返っていることを、箱柱の 29 枚すべてで確認する。
+    """
+    v, f = builder()
+    normals = fifth.compute_normals(v, f)
+    shared_of = fifth.build_shared_of(f)
+    edges = fifth.build_adjacency_graph(f)
+    trees = fifth.enumerate_spanning_trees(edges, len(f))
+    nets = list(fifth.iter_unique_nets(v, f, trees, normals))
+    assert nets, "展開図が1つも無いと空振りになる"
+
+    for tree, polys in nets:
+        face_sum = sum(p.length for p in polys)
+        glued = sum(
+            float(np.linalg.norm(v[a] - v[b]))
+            for u, w in tree
+            for a, b in [shared_of[(u, w)]]
+        )
+        assert glued > 0, "全域木なので折り曲げ軸が1本以上ある"
+        m = fifth.net_metrics(polys, tree, v, shared_of)
+        assert m.perimeter == pytest.approx(face_sum - 2.0 * glued, abs=1e-9)
+
+
+def test_unit_cube_net_perimeter_is_14():
+    """単位立方体の展開図の外周長は全11枚とも 14。
+
+    6枚の正方形の周長 4.0 を足して 24.0、折り曲げ軸 5本の長さ 1.0 を
+    2 倍して引く。定義から手で計算できる値なので実装の検算になる。
+    """
+    v, f = cube()
+    normals = fifth.compute_normals(v, f)
+    shared_of = fifth.build_shared_of(f)
+    trees = fifth.enumerate_spanning_trees(fifth.build_adjacency_graph(f), len(f))
+    nets = list(fifth.iter_unique_nets(v, f, trees, normals))
+
+    assert len(nets) == 11
+    for tree, polys in nets:
+        assert fifth.net_metrics(polys, tree, v, shared_of).perimeter == pytest.approx(14.0)
+
+
+def test_perimeter_is_not_the_bounding_box_perimeter():
+    """外周長は外接矩形の周長以上になる（L 字型では凹みがあるので厳密に大きい）。
+
+    凹みのない矩形なら等しい。``2*(w+h)`` は「外接矩形の周長」であって
+    「展開図の外周長」ではない、というのが主張。
+    """
+    v, f = l_shape()
+    normals = fifth.compute_normals(v, f)
+    shared_of = fifth.build_shared_of(f)
+    edges = fifth.build_adjacency_graph(f)
+    trees = fifth.enumerate_spanning_trees(edges, len(f))
+    nets = list(fifth.iter_unique_nets(v, f, trees, normals))
+    assert nets, "展開図が1つも無いと空振りになる"
+
+    strictly_bigger = 0
+    for tree, polys in nets:
+        m = fifth.net_metrics(polys, tree, v, shared_of)
+        old = _old_bbox_perimeter(polys)
+        assert m.perimeter >= old - 1e-9  # 多角形の周長は外接矩形の周長以上
+        if m.perimeter > old + 1e-9:
+            strictly_bigger += 1
+
+    # 凹みのある展開図が1つでもあれば 2*(w+h) は外周長と違うと分かる
+    assert strictly_bigger > 0, "L字柱なのに外周長と外接矩形の周長が一致した"
+
+
+def test_net_metrics_bbox_area_matches_width_times_height():
+    v, f = cube()
+    normals = fifth.compute_normals(v, f)
+    shared_of = fifth.build_shared_of(f)
+    edges = fifth.build_adjacency_graph(f)
+    trees = fifth.enumerate_spanning_trees(edges, len(f))
+    tree, polys = next(iter(fifth.iter_unique_nets(v, f, trees, normals)))
+
+    m = fifth.net_metrics(polys, tree, v, shared_of)
+    assert m.bounding_box_area == pytest.approx(
+        m.bounding_box_width * m.bounding_box_height
+    )
+
+
 # --------------------------------------------------------------------------
 # 一意な展開図の抽出
 # --------------------------------------------------------------------------

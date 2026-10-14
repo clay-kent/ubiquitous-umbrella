@@ -366,6 +366,20 @@ def orient_faces_outward(
     return oriented
 
 
+def build_shared_of(faces: list[list[int]]) -> dict[tuple[int, int], tuple[int, int]]:
+    """(面u, 面v) -> 共有辺 の両方向マップを作る。
+
+    隣接する 2 面が共有する辺はちょうど 1 本なので、(u, v) と (v, u) は
+    同じ辺を指す。親子関係も評価指標もこれで「どの面とどの面が折線で
+    つながっているか」を引く。
+    """
+    shared_of: dict[tuple[int, int], tuple[int, int]] = {}
+    for u, v, edge in build_adjacency_with_edges(faces):
+        shared_of[(u, v)] = edge
+        shared_of[(v, u)] = edge
+    return shared_of
+
+
 def prepare_layout(
     vertices: np.ndarray, faces: list[list[int]], normals: list[np.ndarray]
 ) -> dict:
@@ -373,11 +387,6 @@ def prepare_layout(
 
     全域木1つにつき1回しか使わない値だが、候補が数千本あるため先にまとめておく。
     """
-    shared_of: dict[tuple[int, int], tuple[int, int]] = {}
-    for u, v, edge in build_adjacency_with_edges(faces):
-        shared_of[(u, v)] = edge
-        shared_of[(v, u)] = edge
-
     origin = vertices[faces[0][0]]
     u_x = vertices[faces[0][1]] - origin
     u_x = u_x / np.linalg.norm(u_x)
@@ -386,7 +395,7 @@ def prepare_layout(
     u_y = np.array([ny_ * uz - nz_ * uy, nz_ * ux - nx_ * uz, nx_ * uy - ny_ * ux])
 
     return {
-        "shared_of": shared_of,
+        "shared_of": build_shared_of(faces),
         "origin": origin,
         "u_x": u_x,
         "u_y": u_y,
@@ -557,6 +566,53 @@ def is_valid_layout(polygons) -> bool:
             ):
                 return False
     return True
+
+
+class NetMetrics(NamedTuple):
+    """展開図 1 枚分の評価指標。"""
+
+    bounding_box_width: float
+    bounding_box_height: float
+    bounding_box_area: float
+    perimeter: float
+
+
+def net_metrics(
+    polys: list[Polygon],
+    tree_edges: list[tuple[int, int]],
+    vertices: np.ndarray,
+    shared_of: dict[tuple[int, int], tuple[int, int]],
+) -> NetMetrics:
+    """展開図の評価指標を求める。
+
+    **外周長 = 全面の周長合計 − 2 × 折り曲げ軸の長さ合計**。
+
+    展開図の外周は「折ったときに消える内側の棱」だけ短い。
+    したがって外接矩形の周長 ``2*(w+h)`` は外周長ではない
+    （L 字型の展開図では外接矩形の空这部分だけ周を含む）。
+
+    ここが指標の**唯一の定義**。API と CLI はどちらもこれを呼ぶ。
+    """
+    # 指標は軽いので全部つないでもきる。重い JSON 化は上位 n 個だけで行う。
+    # 全頂点を Python で回ると一意な展開図の数だけ遅くなるので、
+    # 外接矩形（bounds）だけから求める。
+    boxes = [p.bounds for p in polys]
+    bbox_w = max(b[2] for b in boxes) - min(b[0] for b in boxes)
+    bbox_h = max(b[3] for b in boxes) - min(b[1] for b in boxes)
+
+    glued = 0.0
+    for u, v in tree_edges:
+        edge = shared_of.get((u, v))
+        if edge is not None:
+            a, b = edge
+            glued += float(np.linalg.norm(vertices[a] - vertices[b]))
+
+    return NetMetrics(
+        bounding_box_width=float(bbox_w),
+        bounding_box_height=float(bbox_h),
+        bounding_box_area=float(bbox_w * bbox_h),
+        perimeter=float(sum(p.length for p in polys) - 2.0 * glued),
+    )
 
 
 def _face_area_3d(vertices: np.ndarray, face: list[int]) -> float:

@@ -200,18 +200,16 @@ def main() -> None:
     nets = list(fifth.iter_unique_nets(vertices, faces, trees, normals))
 
     metrics = []
-    for _, polys in nets:
-        xs: list[float] = []
-        ys: list[float] = []
-        for poly in polys:
-            x, y = poly.exterior.xy
-            xs.extend(x)
-            ys.extend(y)
-        w, h = max(xs) - min(xs), max(ys) - min(ys)
-        area = w * h
-        perim = 2.0 * (w + h)
-        metrics.append((area if args.sort_by == "area" else perim, polys, area, perim))
-    metrics.sort(key=lambda item: item[0])
+    shared_of = fifth.build_shared_of(faces)
+    for tree, polys in nets:
+        m = fifth.net_metrics(polys, tree, vertices, shared_of)
+        metrics.append((m, polys))
+    key = (
+        (lambda s: s[0].bounding_box_area)
+        if args.sort_by == "area"
+        else (lambda s: s[0].perimeter)
+    )
+    metrics.sort(key=key)
 
     if args.top_n > 0:
         metrics = metrics[: args.top_n]
@@ -220,10 +218,13 @@ def main() -> None:
     print(f"一意な展開図: {len(metrics)} 個{suffix}")
     os.makedirs(args.outdir, exist_ok=True)
 
-    for idx, (_, polys, area, perim) in enumerate(metrics, start=1):
+    for idx, (m, polys) in enumerate(metrics, start=1):
         filename = os.path.join(args.outdir, f"{args.solid}_net_{idx}.png")
-        plot_net(polys, f"{args.solid} net {idx}  area={area:g}", filename)
-        print(f"Saved: {filename}  (外接矩形面積 {area:g}, 外周長 {perim:g})")
+        plot_net(polys, f"{args.solid} net {idx}  area={m.bounding_box_area:g}", filename)
+        print(
+            f"Saved: {filename}  "
+            f"(外接矩形面積 {m.bounding_box_area:g}, 外周長 {m.perimeter:g})"
+        )
 
 
 if __name__ == "__main__":

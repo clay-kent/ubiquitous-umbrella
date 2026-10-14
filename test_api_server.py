@@ -716,6 +716,73 @@ def test_every_make_nets_preset_is_a_valid_solid():
         assert vertices.shape == (len(v), 3), name
 
 
+def test_api_and_cli_compute_the_same_perimeter():
+    """API と CLI が同じ数字を出す（PR3 で指標の定義を fifth に一元化した）。
+
+    それまでは API が「周長合計 − 2×折り曲げ軸」、CLI が「外接矩形の周長
+    2*(w+h)」という**別の量**を計算していた。両者が同じ fifth.net_metrics
+    を呼んでいることを確認する。
+    """
+    import make_nets
+
+    import fifth
+
+    v, f = make_nets.box(1, 1, 3)
+    r = client.post(
+        URL,
+        json={
+            "vertices": [[float(c) for c in p] for p in v.tolist()],
+            "faces": f,
+            "top_n": 5,
+            "sort_by": "perimeter",
+        },
+    )
+    assert r.status_code == 200, r.text[:400]
+    api_perimeters = [net["metrics"]["perimeter"] for net in r.json()["nets"]]
+    assert api_perimeters
+
+    # 同じ展開図集合を CLI 側で評価して一致を確認する
+    vertices, faces = api_server._build_solid(
+        api_server.SolidRequest(vertices=v.tolist(), faces=f)
+    )
+    normals = fifth.compute_normals(vertices, faces)
+    shared_of = fifth.build_shared_of(faces)
+    trees = fifth.enumerate_spanning_trees(
+        fifth.build_adjacency_graph(faces), len(faces)
+    )
+    nets = list(fifth.iter_unique_nets(vertices, faces, trees, normals))
+    scored = sorted(
+        (
+            (
+                fifth.net_metrics(polys, tree, vertices, shared_of),
+                polys,
+            )
+            for tree, polys in nets
+        ),
+        key=lambda s: s[0].perimeter,
+    )
+    assert [m.perimeter for m, _ in scored[: len(api_perimeters)]] == pytest.approx(
+        api_perimeters
+    )
+
+
+def test_perimeter_is_not_the_bounding_box_perimeter():
+    """応答の perimeter が 2*(w+h) ではないことの直接確認。
+
+    外周長は「全面の周長合計 − 2×折り曲げ軸」。外接矩形の周長とは別物。
+    """
+    profile = [(0, 0), (3, 0), (3, 1), (1, 1), (1, 2), (0, 2)]
+    vertices = [[x, y, float(z)] for z in (0.0, 1.0) for x, y in profile]
+    faces = [[5, 4, 3, 2, 1, 0], list(range(6, 12))]
+    faces += [[i, (i + 1) % 6, 6 + (i + 1) % 6, 6 + i] for i in range(6)]
+
+    r = client.post(URL, json={"vertices": vertices, "faces": faces, "top_n": 1})
+    assert r.status_code == 200, r.text[:400]
+    m = r.json()["nets"][0]["metrics"]
+    bbox_perimeter = 2.0 * (m["bounding_box"]["width"] + m["bounding_box"]["height"])
+    assert m["perimeter"] != pytest.approx(bbox_perimeter, abs=1e-9)
+
+
 # --------------------------------------------------------------------------
 # CORS
 # --------------------------------------------------------------------------

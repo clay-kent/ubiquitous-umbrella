@@ -231,38 +231,34 @@ def calculate_nets(req: SolidRequest):
     except ValueError as exc:
         raise _error("invalid_solid", str(exc)) from exc
 
-    edge_lengths = {
-        edge: float(np.linalg.norm(vertices[edge[0]] - vertices[edge[1]]))
-        for edge in fifth.build_edge_map(faces)
-    }
+    shared_of = fifth.build_shared_of(faces)
     pair_to_edge = fifth._pair_to_edge(faces)
 
-    def metrics_of(polys: list, tree: list[tuple[int, int]]) -> dict:
-        # 全頂点を Python で回ると一意な展開図の数だけ遅くなるので、
-        # 外接矩形（bounds）だけから求める。
-        boxes = [p.bounds for p in polys]
-        bbox_w = max(b[2] for b in boxes) - min(b[0] for b in boxes)
-        bbox_h = max(b[3] for b in boxes) - min(b[1] for b in boxes)
+    def metrics_json(m: fifth.NetMetrics) -> dict:
+        """NamedTuple はそのままだと JSON の配列になるので、応答の形に戻す。
 
-        # 外周長 = 全面の周長合計 - 2 * 折り曲げ軸の長さ
-        glued = 0.0
-        for u, v in tree:
-            edge = pair_to_edge.get(frozenset((u, v)))
-            if edge is not None:
-                glued += edge_lengths[edge]
-
+        指標の**計算**は fifth.net_metrics に一本化し、
+        **JSON の形**はここ（応答仕様）側で決める。
+        """
         return {
-            "bounding_box": {"width": float(bbox_w), "height": float(bbox_h)},
-            "bounding_box_area": float(bbox_w * bbox_h),
-            "perimeter": float(sum(p.length for p in polys) - 2.0 * glued),
+            "bounding_box": {"width": m.bounding_box_width, "height": m.bounding_box_height},
+            "bounding_box_area": m.bounding_box_area,
+            "perimeter": m.perimeter,
         }
 
-    # 指標は軽いので全部つないでもきる。重い JSON 化は上位 n 個だけで行う。
-    scored = [(metrics_of(polys, tree), tree, polys) for tree, polys in unique]
+    # 指標の計算は fifth.net_metrics に一本化した。ここは JSON の形にするだけ。
+    scored = [
+        (
+            fifth.net_metrics(polys, tree, vertices, shared_of),
+            tree,
+            polys,
+        )
+        for tree, polys in unique
+    ]
     key = (
-        (lambda s: s[0]["bounding_box_area"])
+        (lambda s: s[0].bounding_box_area)
         if req.sort_by == "area"
-        else (lambda s: s[0]["perimeter"])
+        else (lambda s: s[0].perimeter)
     )
     scored.sort(key=key)
 
@@ -271,7 +267,7 @@ def calculate_nets(req: SolidRequest):
         selected.append(
             {
                 "net_id": i + 1,
-                "metrics": metrics,
+                "metrics": metrics_json(metrics),
                 "faces": _face_geometry(
                     vertices, faces, normals, tree, polys, pair_to_edge
                 ),

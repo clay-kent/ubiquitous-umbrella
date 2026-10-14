@@ -64,6 +64,13 @@ python make_nets.py --solid pyr4 --outdir images
 - `--sort-by`: `area`（外接矩形の面積）/ `perimeter`（外周長）
 - `--outdir`: 保存先ディレクトリ（既定 `nets`）
 
+> **`--sort-by perimeter` の定義変更（v3 PR3）**
+> 以前は外接矩形の周長 `2*(w+h)` で並べていましたが、現在は API と同じ
+> **外周長（全面の周長合計 − 2 × 折り曲げ軸の長さ合計）** で並べます。
+> 表示される値だけでなく、`--top-n` で**選ばれる展開図も変わります**
+> （L 字型の展開図のように外接矩形の空部分を含む形状では差が出るため）。
+> たとえば 5角柱は上位3枚すべてが外周長 19.4046 になります。
+
 独自の立体を描きたい場合は `make_nets.py` に頂点と面を定義した関数を追加し、`SOLIDS` に登録してください。API 経由で計算したい場合は下の `POST /api/net/calculate` を使えば同じ結果が得られます。
 
 ### API サーバーの起動
@@ -169,7 +176,7 @@ uvicorn api_server:app --reload
 | `net_id` | 1 からの連番。`sort_by` の良い順 |
 | `metrics.bounding_box` | 展開図の外接矩形の幅・高さ |
 | `metrics.bounding_box_area` | 外接矩形の面積 |
-| `metrics.perimeter` | 展開図の外周長 |
+| `metrics.perimeter` | 展開図の外周長 = 全面の周長合計 − 2 × 折り曲げ軸の長さ合計。外接矩形の周長ではない |
 | `vertices_2d` | 展開図上のその面の頂点座標（頂点数は元の面と一致） |
 | `parent_face_id` | 展開図の木構造における親の面。根（面0）は `null` |
 | `dihedral_angle` | 親の面との**内側の二面角**（度）。凸角は 0〜180、凹角は 180〜360。根は `null` |
