@@ -4,7 +4,6 @@ import sys
 from collections.abc import Iterable, Iterator
 from typing import NamedTuple
 
-import networkx as nx
 import numpy as np
 import shapely
 from shapely.geometry import Polygon
@@ -21,6 +20,14 @@ FACE_NORMAL_REL_TOL = 1e-12
 # 精度指定ではなく「実重なりと浮動ノイズの間の空白に置く」ための値。
 # 実測: 実重なりは最小 1.0、ダストは 1e-9 未満なので 9 桁の余裕がある。
 OVERLAP_AREA_REL_TOL = 1e-7
+
+# 個別化-細分の仕事量上限。これを超えると 422 で失敗させる。
+# 根拠（実測）: どのプリセットでも最大でも 126 程度（prism5）。最も重い
+# lshape でも数千程度なので 1500 倍以上の余裕があり、実入力では到達しない。
+# 到達しないからこそ、唯一の妥当な停止条件は中断である
+# （以前は「超えたら 1 枚捨てて VF2 同型判定に回る」フォールバックがあるが、
+#   1500 倍の余裕に対して発動しない＝死んだ経路であり、消した）。
+SEARCH_BUDGET = 200_000
 
 
 class SolidError(ValueError):
@@ -772,97 +779,6 @@ def face_geometries(
     return out
 
 
-def build_ribbon_graph(
-    vertices: np.ndarray,
-    faces: list[list[int]],
-    tree_edges: list[tuple[int, int]],
-) -> nx.DiGraph:
-    """展開図の木構造から半辺グラフ (Ribbon Graph) を構築する。
-
-    ノード: 各面の各辺に対応する半辺 (face_index, edge_index)
-      - 属性 `length`: 辺の長さ (丸め処理)
-    エッジ:
-      - 'next' 型の有向エッジ: 同一面上での巡回順序 (CCW)
-      - 'glue' 型の無向/双方向有向エッジ: 隣接面間の接着
-        - 属性 `flipped`: 接着される向き
-    """
-    g: nx.DiGraph = nx.DiGraph()
-
-    # 1. ハーフエッジのノードを作成し、面内の「next」エッジで巡回的に結ぶ
-    for f_idx, face in enumerate(faces):
-        n_v = len(face)
-        for i in range(n_v):
-            p1 = vertices[face[i]]
-            p2 = vertices[face[(i + 1) % n_v]]
-            length = np.linalg.norm(p2 - p1)
-
-            node_id = (f_idx, i)
-            g.add_node(node_id, length=round(length, 5))
-
-        # nextエッジを追加 (面をCCWに一周するサイクル)
-        for i in range(n_v):
-            g.add_edge((f_idx, i), (f_idx, (i + 1) % n_v), type="next")
-
-    # 2. 面間の接着 (glue) エッジを追加
-    for u, v in tree_edges:
-        # 面uと面vの共有頂点を3Dで探す
-        shared = set(faces[u]) & set(faces[v])
-        if len(shared) != 2:
-            continue
-
-        # 面uにおける共有辺のインデックスを探す
-        idx_u = None
-        n_u = len(faces[u])
-        for i in range(n_u):
-            a, b = faces[u][i], faces[u][(i + 1) % n_u]
-            if a in shared and b in shared:
-                idx_u = i
-                break
-
-        # 面vにおける共有辺のインデックスを探す
-        idx_v = None
-        n_v = len(faces[v])
-        for i in range(n_v):
-            a, b = faces[v][i], faces[v][(i + 1) % n_v]
-            if a in shared and b in shared:
-                idx_v = i
-                break
-
-        if idx_u is not None and idx_v is not None:
-            # glueエッジを双方向で接続
-            u_start, u_end = faces[u][idx_u], faces[u][(idx_u + 1) % n_u]
-            v_start, v_end = faces[v][idx_v], faces[v][(idx_v + 1) % n_v]
-
-            flipped = (u_start == v_end) and (u_end == v_start)
-
-            g.add_edge((u, idx_u), (v, idx_v), type="glue", flipped=flipped)
-            g.add_edge((v, idx_v), (u, idx_u), type="glue", flipped=flipped)
-
-    return g
-
-
-def is_isomorphic_net(g1: nx.DiGraph, g2: nx.DiGraph) -> bool:
-    """2つの半辺グラフが同型であるかを判定する。"""
-    def node_match(n1, n2):
-        # build_ribbon_graph は round(length, 5) で丸めた値を格納している。
-        # _ribbon_invariant も同じ丸めを使うので、両者を完全一致で比較することで
-        # 不変量だけが別になるケースを防げるよう、両者の丸めを揃える。
-        return n1["length"] == n2["length"]
-
-    def edge_match(e1, e2):
-        # エッジのタイプ (next or glue) と flipped 属性が一致するかチェック
-        if e1["type"] != e2["type"]:
-            return False
-        if e1["type"] == "glue":
-            return e1.get("flipped") == e2.get("flipped")
-        return True
-
-    GM = nx.algorithms.isomorphism.DiGraphMatcher(
-        g1, g2, node_match=node_match, edge_match=edge_match
-    )
-    return GM.is_isomorphic()
-
-
 class RibbonContext:
     """半辺構造の前計算結果。全域木ごとに変わらないので一度だけ作る。"""
 
@@ -932,8 +848,8 @@ def _glue_arrays(
 ) -> tuple[list[int], list[bool]]:
     """半辺の「接着相手」と「接着の向き」を求める。
 
-    glue は build_ribbon_graph が双方向に張るので、is_isomorphic_net から見れば
-    無向辺になっている。ここでは向きを区別せず「接着相手」として扱う。
+    接着は双方向なので無向辺になっている。ここでは向きを区別せず
+    「接着相手」として扱う。
     """
     faces = ctx.faces
     n_nodes = ctx.n_nodes
@@ -987,11 +903,20 @@ def _individualize_refine(
     flip: list[bool],
     color: list,
     budget: list[int],
-) -> tuple | None:
-    """個別化-細分による正規形。予算超過なら None（呼び出し側は VF2 にフォールバック）。"""
+) -> tuple:
+    """個別化-細分による正規形。
+
+    予算超過時は ``None`` を返さず ``SolidError`` を投げる。
+    返すと「その木は重複 Didn't と判断された」ように見えてしまい、
+    結果として**静かに誤った一意数**を返すことになる。
+    """
     n = len(nxt)
-    if budget[0] > 200_000:
-        return None
+    if budget[0] > SEARCH_BUDGET:
+        raise SolidError(
+            "search_budget_exceeded",
+            "展開図の同型判定が計算量上限を超えました。"
+            "面の数を減らしてください。",
+        )
     budget[0] += n
 
     color = _wl_refine(nxt, partner, flip, color)
@@ -1013,50 +938,22 @@ def _individualize_refine(
         branch = list(color)
         branch[v] = min(color) - 1  # 既存の色と衝突しない新しい色
         got = _individualize_refine(nxt, partner, flip, branch, budget)
-        if got is None:
-            return None
         if best is None or got < best:
             best = got
     return best
 
 
-def _ribbon_invariant(ctx: RibbonContext, tree_edges: list[tuple[int, int]]) -> tuple:
-    """半辺構造の同型不変量（Weisfeiler-Lehman 色の細分のみ）。
-
-    同型な半辺グラフは必ず同じ不変量を持つ（分離は起きない）。
-    ただし別々の展開図が同じ不変量になることもあるため、
-    この値だけで同一とは判定せず is_isomorphic_net を併用する。
-    """
-    partner, flip = _glue_arrays(ctx, tree_edges)
-    color = [(ctx.edge_len[i], partner[i] >= 0, flip[i]) for i in range(ctx.n_nodes)]
-    return tuple(sorted(_wl_refine(ctx.nxt, partner, flip, color)))
-
-
 def _net_signature(
     ctx: RibbonContext, tree_edges: list[tuple[int, int]]
-) -> tuple | None:
+) -> tuple:
     """展開図の正規形（同型なら必ず一致するキー）。
 
     個別化-細分が全ての半辺を区別できた場合、その色は完全な同型判定になる。
-    予算超過で失敗したときだけ None を返し、VF2 に任せる。
+    予算超過は :func:`_individualize_refine` が ``SolidError`` で報告する。
     """
     partner, flip = _glue_arrays(ctx, tree_edges)
     color = [(ctx.edge_len[i], partner[i] >= 0, flip[i]) for i in range(ctx.n_nodes)]
     return _individualize_refine(ctx.nxt, partner, flip, color, [0])
-
-
-
-def reverse_ribbon_graph(g: nx.DiGraph) -> nx.DiGraph:
-    """ハーフエッジグラフの面内有向エッジ(next)をすべて反転させた、鏡像（裏返し）グラフを生成する。"""
-    rev_g: nx.DiGraph = nx.DiGraph()
-    for node, data in g.nodes(data=True):
-        rev_g.add_node(node, **data)
-    for u, v, data in g.edges(data=True):
-        if data["type"] == "next":
-            rev_g.add_edge(v, u, **data)
-        else:
-            rev_g.add_edge(u, v, **data)
-    return rev_g
 
 
 def iter_unique_nets(
@@ -1067,95 +964,46 @@ def iter_unique_nets(
 ) -> Iterator[tuple[list[tuple[int, int]], list[Polygon]]]:
     """一意な展開図を (全域木, 2Dポリゴン) の組として順に返す。
 
-    2段構えで重複を潰す:
+    重複は「正規形（同型なら必ず一致するキー）」で潰す。
+    鏡像も同一視するので、自身と鏡像の正規形の小さい方をキーにする。
 
-    1. _net_signature（個別化-細分の正規形）だけで一意に決まるものはハッシュで潰す。
-       正規形は同型なら必ず一致し、通常の展開図ではこれだけで完毕する。
-    2. 正規形を予算超過で出せなかった場合だけ、Weisfeiler-Lehman 不変量で
-       バケット分割し、その中でのみ実際の VF2 同型判定（is_isomorphic_net）を行う。
-
-    どちらの段も「同型なら必ず同じバケット」という保証しか持たないため、
-    最終的な正しさは is_isomorphic_net に担保させている。
+    ⚠️ このループを ``except ValueError`` で包まないこと。
+    そうするとループ中のあらゆる ValueError（予算超過を含む）が
+    「この木は捨てる」と解釈され、**静かに誤った一意数**を返す。
+    前条件を破った呼び出しは、投げられたまま呼び出し元へ届くのが正しい。
     """
     ctx = RibbonContext(vertices, faces)
     mirror_ctx = RibbonContext(vertices, [list(reversed(f)) for f in faces])
     layout_prep = prepare_layout(vertices, faces, normals)
 
     exact_seen: set[tuple] = set()
-    buckets: dict[tuple, list[tuple]] = {}
-    graph_cache: dict[tuple, tuple[nx.DiGraph, nx.DiGraph]] = {}
-
-    def graph_pair(tree: list[tuple[int, int]]) -> tuple[nx.DiGraph, nx.DiGraph]:
-        """半辺グラフとその鏡像を作る（同一木の再計算を避けるためキャッシュ）。"""
-        key = tuple(tree)
-        cached = graph_cache.get(key)
-        if cached is None:
-            rg = build_ribbon_graph(vertices, faces, tree)
-            cached = (rg, reverse_ribbon_graph(rg))
-            graph_cache[key] = cached
-        return cached
 
     for tree in all_trees:
-        try:
-            # レイアウトより先に重複を判定する。
-            # 全域木の多くは別の木に既に含まれる重複なので、ここで弾けるほど
-            # 展開と重なり判定の回数が減る（実測で全体の約7割を占めていた）。
-            # 同じ正規形の木は展開図が合同であり重なり判定の結果まで一致する
-            # （test_unique_nets_geometry.py で独立に検証済み）ため、順序を入れ替えても
-            # 返り値は変わらない。
-            sig = _net_signature(ctx, tree)
-            mirror_sig = _net_signature(mirror_ctx, tree)
+        # レイアウトより先に重複を判定する。
+        # 全域木の多くは別の木に既に含まれる重複なので、ここで弾けるほど
+        # 展開と重なり判定の回数が減る（実測で全体の約7割を占めていた）。
+        # 同じ正規形の木は展開図が合同であり重なり判定の結果まで一致する
+        # （test_unique_nets_geometry.py で独立に検証済み）ため、順序を入れ替えても
+        # 返り値は変わらない。
+        sig = _net_signature(ctx, tree)
+        mirror_sig = _net_signature(mirror_ctx, tree)
 
-            if sig is not None and mirror_sig is not None:
-                # 鏡像は同一視するので、自身と鏡像の正規形の小さい方をキーにする。
-                # キーを先に登録してあるので、同型な木は展開せずに弾ける。
-                key = min(sig, mirror_sig)
-                if key in exact_seen:
-                    continue
-                exact_seen.add(key)
-                polys = layout_tree(vertices, faces, normals, tree, layout_prep)
-                if not is_valid_layout(polys):
-                    continue
-                yield tree, polys
-                continue
-
-            inv = _ribbon_invariant(ctx, tree)
-            mirror_inv = _ribbon_invariant(mirror_ctx, tree)
-            bucket = buckets.setdefault(min(inv, mirror_inv), [])
-
-            if bucket:
-                rg, _ = graph_pair(tree)
-                is_duplicate = any(
-                    is_isomorphic_net(rg, other) or is_isomorphic_net(rg, other_rev)
-                    for other, other_rev in (graph_pair(list(t)) for t in bucket)
-                )
-                if is_duplicate:
-                    continue
-
-            polys = layout_tree(vertices, faces, normals, tree, layout_prep)
-            if not is_valid_layout(polys):
-                continue
-            bucket.append(tuple(tree))
-            yield tree, polys
-        except ValueError:
-            # 展開できない木（退化した面など）は静かに捨てる
+        # キーを先に登録してあるので、同型な木は展開せずに弾ける。
+        key = min(sig, mirror_sig)
+        if key in exact_seen:
             continue
+        exact_seen.add(key)
 
-
-def get_unique_nets_by_ribbon_graph(
-    vertices: np.ndarray,
-    faces: list[list[int]],
-    all_trees: Iterable[list[tuple[int, int]]],
-    normals: list[np.ndarray],
-) -> list[list[tuple[int, int]]]:
-    """一意な展開図に対応する全域木を抽出する（iter_unique_nets の簡易ラッパ）。"""
-    return [tree for tree, _ in iter_unique_nets(vertices, faces, all_trees, normals)]
+        polys = layout_tree(vertices, faces, normals, tree, layout_prep)
+        if not is_valid_layout(polys):
+            continue
+        yield tree, polys
 
 
 def generate_unfolding_nets(
     vertices: np.ndarray | list[list[float]], faces: list[list[int]]
 ) -> list[list[Polygon]]:
-    """半辺グラフ同型判定を用いて一意な展開図を生成する。"""
+    """正規形（同型なら必ず一致するキー）で一意な展開図を生成する。"""
     vertices = np.array(vertices, dtype=float)
     n_faces = len(faces)
 

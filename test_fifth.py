@@ -680,18 +680,88 @@ def test_unique_nets_are_fewer_than_all_trees():
     assert len(_unique_nets(v, f)) == 1516
 
 
-def test_get_unique_nets_by_ribbon_graph_returns_spanning_trees():
+def test_errors_inside_the_tree_loop_propagate():
+    """``iter_unique_nets`` のループ中の例外は握り潰されない。
+
+    以前はループ全体を ``except ValueError: continue`` で包んでいたため、
+    予算超過もその他の ValueError も「その木は捨てる」と解釈され、
+    **静かに誤った一意数**を返していた。
+
+    このテストは正常系ではなく guard である:
+    ``_net_signature`` に注入して、-raising ことを確かめる。
+    """
     v, f = cube()
+    faces = fifth.orient_faces_outward(v, f)
     normals = fifth.compute_normals(v, f)
-    edges = fifth.build_adjacency_graph(f)
-    trees = list(fifth.enumerate_spanning_trees(edges, 6))
-    nets = fifth.get_unique_nets_by_ribbon_graph(v, f, trees, normals)
-    assert len(nets) == 11
-    for tree in nets:
-        g = nx.Graph()
-        g.add_nodes_from(range(6))
-        g.add_edges_from(tree)
-        assert nx.is_tree(g)
+    trees = list(fifth.enumerate_spanning_trees(fifth.build_adjacency_graph(f), len(f)))
+
+    boom = ValueError("-loop-boom-")
+    original = fifth._net_signature
+
+    calls = {"n": 0}
+
+    def exploding(ctx, tree):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise boom
+        return original(ctx, tree)
+
+    fifth._net_signature = exploding
+    try:
+        with pytest.raises(ValueError, match="loop-boom"):
+            list(fifth.iter_unique_nets(v, faces, iter(trees), normals))
+    finally:
+        fifth._net_signature = original
+
+
+def test_search_budget_exceeded_raises_a_named_solid_error():
+    """予算超過は ``None`` ではなく ``SolidError('search_budget_exceeded')``。
+
+    ``None`` を返すと VF2 に落ち 있었いので、その戻り値を誰かが
+    ``None`` を返すとフォールバックに落ちていたが、その戻り値を
+    API ではこの例外が 422 の ``type: "search_budget_exceeded"`` になる。
+    """
+    ctx = fifth.RibbonContext(
+        np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1]], dtype=float),
+        [[0, 1, 2, 3], [0, 1, 4]],
+    )
+    budget = [fifth.SEARCH_BUDGET + 1]
+    with pytest.raises(ValueError) as ei:
+        fifth._individualize_refine(ctx.nxt, [-1] * ctx.n_nodes, [False] * ctx.n_nodes, [0] * ctx.n_nodes, budget)
+
+    assert isinstance(ei.value, fifth.SolidError)
+    assert ei.value.code == "search_budget_exceeded"
+
+
+def test_budget_headroom_is_large():
+    """SEARCH_BUDGET は現実のプリセットに対して十分な余裕がある。
+
+    余裕がなければ「到達しないから abort は安全」という前提が崩れる。
+    """
+    for builder in (cube_b, tetrahedron_b, prism4_b, prism5_b, l_shape_b):
+        v, f = builder()
+        faces = fifth.orient_faces_outward(v, f)
+        normals = fifth.compute_normals(v, f)
+        trees = fifth.enumerate_spanning_trees(
+            fifth.build_adjacency_graph(faces), len(faces)
+        )
+        peak = {"v": 0}
+
+        original = fifth._individualize_refine
+
+        def counting(nxt, partner, flip, color, budget, _o=original):
+            try:
+                return _o(nxt, partner, flip, color, budget)
+            finally:
+                peak["v"] = max(peak["v"], budget[0])
+
+        fifth._individualize_refine = counting
+        try:
+            list(fifth.iter_unique_nets(v, faces, trees, normals))
+        finally:
+            fifth._individualize_refine = original
+
+        assert 0 < peak["v"] < fifth.SEARCH_BUDGET / 100, (builder, peak["v"])
 
 
 def test_generate_unfolding_nets_end_to_end():
@@ -699,35 +769,6 @@ def test_generate_unfolding_nets_end_to_end():
     nets = fifth.generate_unfolding_nets(v, f)
     assert len(nets) == 11
     assert all(len(polys) == 6 for polys in nets)
-
-
-def test_canonical_form_agrees_with_vf2_isomorphism():
-    """同じ正規形を持つ木は VF2 でも同型と判定される（鏡像も互いに同型）。"""
-    v, f = prism(4)
-    ctx = fifth.RibbonContext(v, f)
-    mirror_ctx = fifth.RibbonContext(v, [list(reversed(face)) for face in f])
-    trees = list(fifth.enumerate_spanning_trees(fifth.build_adjacency_graph(f), len(f)))
-
-    def key(tree):
-        a = fifth._net_signature(ctx, tree)
-        b = fifth._net_signature(mirror_ctx, tree)
-        return min(a, b)
-
-    buckets: dict = {}
-    for t in trees:
-        buckets.setdefault(key(t), []).append(t)
-
-    checked = 0
-    for bucket in buckets.values():
-        base = fifth.build_ribbon_graph(v, f, bucket[0])
-        for t in bucket[1:]:
-            other = fifth.build_ribbon_graph(v, f, t)
-            assert (
-                fifth.is_isomorphic_net(base, other)
-                or fifth.is_isomorphic_net(base, fifth.reverse_ribbon_graph(other))
-            )
-            checked += 1
-    assert checked > 0
 
 
 def test_net_signature_merges_mirror_images():

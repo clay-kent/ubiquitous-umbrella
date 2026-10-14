@@ -55,6 +55,11 @@ def _ribbon_unique_nets(builder):
         ("pentagonal prism", lambda: make_nets.prism(5), 99),
         ("square pyramid", lambda: make_nets.pyramid(4), 8),
         ("pentagonal pyramid", lambda: make_nets.pyramid(5), 15),
+        # 以下の 2 つは最も重いケース（どちらも全域木 8100 本）。
+        # 正規形の粒度が崩れると軽い立体のテストでは気づけないので、
+        # VF2 を消す前に必ず含める。実測 9.3s / 7.6s。
+        ("L-shape", make_nets.l_shape, 1516),
+        ("hexagonal prism", lambda: make_nets.prism(6), 354),
     ],
     ids=lambda s: str(s).replace(" ", "_"),
 )

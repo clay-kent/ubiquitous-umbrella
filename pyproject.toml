@@ -7,7 +7,6 @@ requires-python = ">=3.13.11"
 dependencies = [
     "fastapi>=0.139.0",
     "matplotlib>=3.10",
-    "networkx>=3.6.1",
     "numpy>=2.5.0",
     "shapely>=2.1.2",
     "uvicorn>=0.35",
@@ -17,6 +16,9 @@ dependencies = [
 dev = [
     "httpx2>=2.13.1",
     "mypy>=2.1.0",
+    # networkx は test_fifth.py の _brute_force_trees（全域木列挙の参照実装）だけが使う。
+    # 本体（fifth.py / api_server.py / make_nets.py）は VF2 削除済みで依存しない。
+    "networkx>=3.6.1",
     "pytest>=9.1.1",
     "types-networkx>=3.6.1.20260612",
     "types-shapely>=2.1.0.20260603",

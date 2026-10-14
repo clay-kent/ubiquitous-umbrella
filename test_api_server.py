@@ -783,6 +783,46 @@ def test_perimeter_is_not_the_bounding_box_perimeter():
     assert m["perimeter"] != pytest.approx(bbox_perimeter, abs=1e-9)
 
 
+def test_search_budget_exceeded_returns_a_422_with_a_branchable_type():
+    """予算超過は 422 `search_budget_exceeded` として外に出る。
+
+    以前は予算超過が ``None`` を返し、それが「重複」と誤解されて
+    **200 で誤った ``total_unique_nets``** になっていた。今は既存の
+    ``except SolidError`` が 422 に変換する（例外クラスは増やしていない）。
+    """
+    import make_nets
+
+    import fifth
+
+    v, f = make_nets.prism(5)
+    original = fifth._individualize_refine
+
+    def always_over_budget(*a, **kw):
+        budget = a[4]
+        budget[0] = fifth.SEARCH_BUDGET + 1
+        return original(*a, **kw)
+
+    fifth._individualize_refine = always_over_budget
+    try:
+        r = client.post(
+            URL,
+            json={
+                "vertices": [[float(c) for c in p] for p in v.tolist()],
+                "faces": f,
+                "top_n": 1,
+            },
+        )
+    finally:
+        fifth._individualize_refine = original
+
+    assert r.status_code == 422, r.text[:400]
+    detail = r.json()["detail"]
+    assert isinstance(detail, list) and detail
+    assert detail[0]["type"] == "search_budget_exceeded"
+    assert detail[0]["loc"] == ["body"]
+    assert "面の数を減らしてください" in detail[0]["msg"]
+
+
 # --------------------------------------------------------------------------
 # CORS
 # --------------------------------------------------------------------------
