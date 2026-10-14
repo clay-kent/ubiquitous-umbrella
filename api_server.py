@@ -1,6 +1,5 @@
 """任意の多面体を受け取り、評価指標の上位 n 個の展開図を JSON で返す API。"""
 
-import math
 import os
 from typing import Literal
 
@@ -124,103 +123,6 @@ class SolidRequest(BaseModel):
     sort_by: Literal["area", "perimeter"] = Field("area", description="並べ替えの基準")
 
 
-def get_layout_parent_relation(
-    faces: list[list[int]], tree_edges: list[tuple[int, int]]
-) -> list[int | None]:
-    """全域木から面の親子関係を求める。面0をルートとする。"""
-    n_faces = len(faces)
-    adj: list[list[int]] = [[] for _ in range(n_faces)]
-    for u, v in tree_edges:
-        adj[u].append(v)
-        adj[v].append(u)
-
-    parent_map: list[int | None] = [None] * n_faces
-    queue = [0]
-    visited = {0}
-    while queue:
-        u = queue.pop(0)
-        for v in adj[u]:
-            if v not in visited:
-                parent_map[v] = u
-                visited.add(v)
-                queue.append(v)
-    return parent_map
-
-
-def _face_area_3d(vertices: np.ndarray, face: list[int]) -> float:
-    acc = np.zeros(3)
-    m = len(face)
-    for i in range(m):
-        acc += np.cross(vertices[face[i]], vertices[face[(i + 1) % m]])
-    return float(np.linalg.norm(acc)) / 2.0
-
-
-def _dihedral_deg(
-    vertices: np.ndarray,
-    faces: list[list[int]],
-    normals: list[np.ndarray],
-    u: int,
-    v: int,
-) -> float:
-    """棱 u-v を挟む、立体の内側の二面角（度）を求める。
-
-    単純な 180 - 角度(法線u, 法線v) では、L字柱のような非凸な立体の
-    凹角（270 度）を 90 度として扱ってしまう。
-    そこで棱に垂直な断面で見たときの「立体の内側の張る角」を求める:
-
-      * 外向き法線 n と、面を一周する向きの棱方向 t の外積が
-        その面の内側（立体側）を指す。
-      * 2つの面の内側方向のなす角を phi（0..180）とする。
-      * その2方向の bisector が立体の内側を向いていれば張る角は phi、
-        外側（凹角）を向いていれば 360 - phi。
-    """
-    n_u = len(faces[u])
-    shared = set(faces[u]) & set(faces[v])
-    # faces[u] の周回順に沿った棱の向きを求める
-    i = next(
-        k for k in range(n_u) if {faces[u][k], faces[u][(k + 1) % n_u]} == shared
-    )
-    j = (i + 1) % n_u
-    t = vertices[faces[u][j]] - vertices[faces[u][i]]
-    norm_t = float(np.linalg.norm(t))
-    if norm_t == 0.0:
-        return 0.0
-    t = t / norm_t
-
-    in_u = np.cross(normals[u], t)   # 面 u の内側（立体側）を指す
-    in_v = -np.cross(normals[v], t)  # 面 v の内側。面 v では棱を逆向きに歩く
-    cos_phi = max(-1.0, min(1.0, float(np.dot(in_u, in_v))))
-    phi = math.degrees(math.acos(cos_phi))
-
-    bisector = in_u + in_v
-    inside = float(np.dot(bisector, normals[u])) < 0.0 and (
-        float(np.dot(bisector, normals[v])) < 0.0
-    )
-    return phi if inside else 360.0 - phi
-
-
-def _pair_to_edge(faces: list[list[int]]) -> dict[frozenset[int], tuple[int, int]]:
-    """{(面u, 面v): 共有辺} のマップを作る。"""
-    return {
-        frozenset((u, v)): edge for u, v, edge in fifth.build_adjacency_with_edges(faces)
-    }
-
-
-def _fold_axis_2d(
-    polys: list, face_id: int, parent_id: int
-) -> list[list[float]] | None:
-    """展開図平面上での折り曲げ軸（2D）を、親面と共有する2頂点から求める。"""
-    def key(pt: tuple[float, float]) -> tuple[float, float]:
-        return (round(pt[0], 9), round(pt[1], 9))
-
-    parent_pts = {key(c) for c in polys[parent_id].exterior.coords}
-    shared = [c for c in polys[face_id].exterior.coords if key(c) in parent_pts]
-    if len(shared) < 2:
-        return None
-    return [[float(shared[0][0]), float(shared[0][1])],
-            [float(shared[1][0]), float(shared[1][1])]]
-
-
 def _face_geometry(
     vertices: np.ndarray,
     faces: list[list[int]],
@@ -229,42 +131,26 @@ def _face_geometry(
     polys: list,
     pair_to_edge: dict[frozenset[int], tuple[int, int]],
 ) -> list[dict]:
-    """各面の2D形状・親子関係・折り曲げ軸/角を JSON 化可能な形にする。"""
-    parent_map = get_layout_parent_relation(faces, tree_edges)
+    """各面の2D形状・親子関係・折り曲げ軸/角を JSON 化可能な形にする。
 
-    out = []
-    for face_id, poly in enumerate(polys):
-        x, y = poly.exterior.xy
-        # shapely は末尾に開始点を重複して持つので取り除く
-        coords = [[float(x[i]), float(y[i])] for i in range(len(x) - 1)]
-
-        parent_id = parent_map[face_id]
-        axis_3d = axis_2d = None
-        dihedral = fold_angle = None
-
-        if parent_id is not None:
-            edge = pair_to_edge.get(frozenset((face_id, parent_id)))
-            if edge is not None:
-                a, b = edge
-                axis_3d = [vertices[a].tolist(), vertices[b].tolist()]
-                axis_2d = _fold_axis_2d(polys, face_id, parent_id)
-                dihedral = _dihedral_deg(vertices, faces, normals, face_id, parent_id)
-                # 平らな展開図を立体に畳み込むのに必要な回転角
-                fold_angle = 180.0 - dihedral
-
-        out.append(
-            {
-                "face_id": face_id,
-                "name": f"面{face_id}",
-                "vertices_2d": coords,
-                "parent_face_id": parent_id,
-                "dihedral_angle": dihedral,
-                "fold_angle": fold_angle,
-                "fold_axis_3d": axis_3d,
-                "fold_axis_2d": axis_2d,
-            }
+    幾何の計算そのものは ``fifth.face_geometries`` にあり、ここは
+    キー名を付けるだけ（JSON の形は応答仕様なのでこの側の都合で決めてよい）。
+    """
+    return [
+        {
+            "face_id": g.face_id,
+            "name": f"面{g.face_id}",
+            "vertices_2d": g.coords,
+            "parent_face_id": g.parent_id,
+            "dihedral_angle": g.dihedral_angle,
+            "fold_angle": g.fold_angle,
+            "fold_axis_3d": g.fold_axis_3d,
+            "fold_axis_2d": g.fold_axis_2d,
+        }
+        for g in fifth.face_geometries(
+            vertices, faces, normals, tree_edges, polys, pair_to_edge
         )
-    return out
+    ]
 
 
 def _error(
@@ -293,19 +179,8 @@ def _error(
 def _build_solid(req: SolidRequest) -> tuple[np.ndarray, list[list[int]]]:
     """入力を検証し、正規化済みの (vertices, faces) を返す。"""
     try:
-        vertices = np.array(req.vertices, dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise _error("vertices_invalid", f"vertices を解釈できません: {exc}") from exc
-
-    if vertices.ndim != 2 or vertices.shape[1] != 3:
-        raise _error(
-            "vertices_shape", "vertices は [[x, y, z], ...] の形式である必要があります。"
-        )
-    if not np.all(np.isfinite(vertices)):
-        raise _error("non_finite_vertex", "vertices に有限でない値があります。")
-
-    faces = [[int(i) for i in f] for f in req.faces]
-    try:
+        vertices = fifth.parse_vertices(req.vertices)
+        faces = [[int(i) for i in f] for f in req.faces]
         fifth.validate_solid(vertices, faces)
         faces = fifth.orient_faces_outward(vertices, faces)
     except fifth.SolidError as exc:
@@ -360,7 +235,7 @@ def calculate_nets(req: SolidRequest):
         edge: float(np.linalg.norm(vertices[edge[0]] - vertices[edge[1]]))
         for edge in fifth.build_edge_map(faces)
     }
-    pair_to_edge = _pair_to_edge(faces)
+    pair_to_edge = fifth._pair_to_edge(faces)
 
     def metrics_of(polys: list, tree: list[tuple[int, int]]) -> dict:
         # 全頂点を Python で回ると一意な展開図の数だけ遅くなるので、
@@ -413,7 +288,7 @@ def calculate_nets(req: SolidRequest):
                 "height": float(np.ptp(vertices[:, 1])),
                 "depth": float(np.ptp(vertices[:, 2])),
             },
-            "total_area": float(sum(_face_area_3d(vertices, f) for f in faces)),
+            "total_area": float(sum(fifth._face_area_3d(vertices, f) for f in faces)),
         },
         "sort_by": req.sort_by,
         "total_unique_nets": len(scored),

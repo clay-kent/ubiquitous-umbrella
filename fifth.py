@@ -1,6 +1,8 @@
 import io
+import math
 import sys
 from collections.abc import Iterable, Iterator
+from typing import NamedTuple
 
 import networkx as nx
 import numpy as np
@@ -33,6 +35,27 @@ class SolidError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def parse_vertices(raw: object) -> np.ndarray:
+    """API が受け取った頂点配列を numpy にし、形と有限性を検査する。
+
+    不正はすべて SolidError にして、code で機械可読に区別できるようにする。
+    呼び出し側は ``except SolidError`` だけで済み、422 への切り分けを
+    1 箇所に集約できる。
+    """
+    try:
+        vertices = np.array(raw, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise SolidError("vertices_invalid", f"vertices を解釈できません: {exc}") from exc
+
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise SolidError(
+            "vertices_shape", "vertices は [[x, y, z], ...] の形式である必要があります。"
+        )
+    if not np.all(np.isfinite(vertices)):
+        raise SolidError("non_finite_vertex", "vertices に有限でない値があります。")
+    return vertices
 
 
 def validate_solid(
@@ -374,6 +397,50 @@ def prepare_layout(
     }
 
 
+def _tree_bfs(
+    n_faces: int, tree_edges: list[tuple[int, int]]
+) -> tuple[list[int | None], list[tuple[int, int]]]:
+    """全域木の親子関係と、親が子より先に並ぶ ``(親, 子)`` の列を返す。
+
+    **これが唯一の走査定義**。``layout_tree`` の回転の伝播も
+    ``layout_parent_relation`` の親子関係も、ここから作られる。
+
+    契約: 根は面0。親は木の無向隣接を幅優先に走査し、
+    最初に訪れた未訪問の隣接面を親として割り当てる。根の親は None。
+
+    ``(親, 子)`` の列も返すのは、呼び出し側で ``parents[v]`` を引くと
+    ``int | None`` がリストへの添字として型エラーになるため。
+    走査順そのものを渡す。
+    """
+    adj: list[list[int]] = [[] for _ in range(n_faces)]
+    for u, v in tree_edges:
+        adj[u].append(v)
+        adj[v].append(u)
+
+    parents: list[int | None] = [None] * n_faces
+    pairs: list[tuple[int, int]] = []
+    visited = {0}
+    queue = [0]
+    for u in queue:
+        for v in adj[u]:
+            if v not in visited:
+                visited.add(v)
+                parents[v] = u
+                pairs.append((u, v))
+                queue.append(v)
+    return parents, pairs
+
+def layout_parent_relation(
+    n_faces: int, tree_edges: list[tuple[int, int]]
+) -> list[int | None]:
+    """全域木から面の親子関係を求める（面0が根、ルートは None）。
+
+    契約は :func:`_tree_bfs` に書いてある。折り曲げ軸は「親と共有する辺」なので、
+    ここが変わると API 応答の ``fold_axis_*`` も変わる。契約として固定すること。
+    """
+    return _tree_bfs(n_faces, tree_edges)[0]
+
+
 def layout_tree(
     vertices: np.ndarray,
     faces: list[list[int]],
@@ -392,51 +459,48 @@ def layout_tree(
     shared_of = precomputed["shared_of"]
     n_faces = len(faces)
 
-    adj: list[list[int]] = [[] for _ in range(n_faces)]
-    for u, v in tree_edges:
-        adj[u].append(v)
-        adj[v].append(u)
+    _parents, pairs = _tree_bfs(n_faces, tree_edges)
 
-    rot: list[np.ndarray | None] = [None] * n_faces
-    off: list[np.ndarray | None] = [None] * n_faces
-    rot[0] = np.eye(3)
-    off[0] = np.zeros(3)
+    # 親が子より先に現れる幅優先順で、回転と平行移動を伝播させる。
+    # placed は到達した面だけ True にする（rot の型を Optional にしないため）。
+    eye = np.eye(3)
+    zero = np.zeros(3)
+    rot = [eye] * n_faces
+    off = [zero] * n_faces
+    placed = [False] * n_faces
+    placed[0] = True
 
-    queue = [0]
-    for u in queue:
-        for v in adj[u]:
-            if rot[v] is not None:
-                continue
-            edge = shared_of.get((u, v))
-            if edge is None:
-                continue
+    for u, v in pairs:
+        # tree_edges は build_adjacency_graph 由来の全域木なので共有辺は必ず存在する。
+        # そうでない呼び出し（利用者が前条件を破った場合）はここで KeyError になる。
+        edge = shared_of[(u, v)]
 
-            p_a = vertices[edge[0]]
-            p_b = vertices[edge[1]]
-            k = (p_b - p_a) / np.linalg.norm(p_b - p_a)
-            kx, ky, kz = k.tolist()
-            nx_, ny_, nz_ = normals[u].tolist()
-            mx, my, mz = normals[v].tolist()
+        p_a = vertices[edge[0]]
+        p_b = vertices[edge[1]]
+        k = (p_b - p_a) / np.linalg.norm(p_b - p_a)
+        kx, ky, kz = k.tolist()
+        nx_, ny_, nz_ = normals[u].tolist()
+        mx, my, mz = normals[v].tolist()
 
-            c = mx * nx_ + my * ny_ + mz * nz_
-            # s = dot(cross(k, n_v), n_u) （np.cross は微小配列では極端に遅い）
-            s = (
-                (ky * mz - kz * my) * nx_
-                + (kz * mx - kx * mz) * ny_
-                + (kx * my - ky * mx) * nz_
-            )
-            v1c = 1.0 - c
-            r = np.array(
-                [
-                    [kx * kx * v1c + c, kx * ky * v1c - kz * s, kx * kz * v1c + ky * s],
-                    [ky * kx * v1c + kz * s, ky * ky * v1c + c, ky * kz * v1c - kx * s],
-                    [kz * kx * v1c - ky * s, kz * ky * v1c + kx * s, kz * kz * v1c + c],
-                ]
-            )
+        c = mx * nx_ + my * ny_ + mz * nz_
+        # s = dot(cross(k, n_v), n_u) （np.cross は微小配列では極端に遅い）
+        s = (
+            (ky * mz - kz * my) * nx_
+            + (kz * mx - kx * mz) * ny_
+            + (kx * my - ky * mx) * nz_
+        )
+        v1c = 1.0 - c
+        r = np.array(
+            [
+                [kx * kx * v1c + c, kx * ky * v1c - kz * s, kx * kz * v1c + ky * s],
+                [ky * kx * v1c + kz * s, ky * ky * v1c + c, ky * kz * v1c - kx * s],
+                [kz * kx * v1c - ky * s, kz * ky * v1c + kx * s, kz * kz * v1c + c],
+            ]
+        )
 
-            rot[v] = rot[u] @ r
-            off[v] = rot[u] @ (p_a - r @ p_a) + off[u]
-            queue.append(v)
+        rot[v] = rot[u] @ r
+        off[v] = rot[u] @ (p_a - r @ p_a) + off[u]
+        placed[v] = True
 
     origin = precomputed["origin"]
     u_x = precomputed["u_x"]
@@ -445,9 +509,9 @@ def layout_tree(
 
     coords = []
     for i in range(n_faces):
-        face_rot, t = rot[i], off[i]
-        if face_rot is None:
+        if not placed[i]:
             raise ValueError(f"面{i} へ到達できませんでした（全域木が不正です）。")
+        face_rot, t = rot[i], off[i]
         # p_trans = r @ p + t を、2D 投影に代入してまとめて計算する
         axis_x = face_rot.T @ u_x
         axis_y = face_rot.T @ u_y
@@ -493,6 +557,163 @@ def is_valid_layout(polygons) -> bool:
             ):
                 return False
     return True
+
+
+def _face_area_3d(vertices: np.ndarray, face: list[int]) -> float:
+    """面の面積を Newell の式で求める（3D 上の値）。"""
+    acc = np.zeros(3)
+    m = len(face)
+    for i in range(m):
+        acc += np.cross(vertices[face[i]], vertices[face[(i + 1) % m]])
+    return float(np.linalg.norm(acc)) / 2.0
+
+
+def _dihedral_deg(
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    normals: list[np.ndarray],
+    u: int,
+    v: int,
+) -> float:
+    """棱 u-v を挟む、立体の内側の二面角（度）を求める。
+
+    単純な 180 - 角度(法線u, 法線v) では、L字柱のような非凸な立体の
+    凹角（270 度）を 90 度として扱ってしまう。
+    そこで棱に垂直な断面で見たときの「立体の内側の張る角」を求める:
+
+      * 外向き法線 n と、面を一周する向きの棱方向 t の外積が
+        その面の内側（立体側）を指す。
+      * 2つの面の内側方向のなす角を phi（0..180）とする。
+      * その2方向の bisector が立体の内側を向いていれば張る角は phi、
+        外側（凹角）を向いていれば 360 - phi。
+    """
+    n_u = len(faces[u])
+    shared = set(faces[u]) & set(faces[v])
+    # faces[u] の周回順に沿った棱の向きを求める
+    i = next(
+        k for k in range(n_u) if {faces[u][k], faces[u][(k + 1) % n_u]} == shared
+    )
+    j = (i + 1) % n_u
+    t = vertices[faces[u][j]] - vertices[faces[u][i]]
+    norm_t = float(np.linalg.norm(t))
+    if norm_t == 0.0:
+        return 0.0
+    t = t / norm_t
+
+    in_u = np.cross(normals[u], t)   # 面 u の内側（立体側）を指す
+    in_v = -np.cross(normals[v], t)  # 面 v の内側。面 v では棱を逆向きに歩く
+    cos_phi = max(-1.0, min(1.0, float(np.dot(in_u, in_v))))
+    phi = math.degrees(math.acos(cos_phi))
+
+    bisector = in_u + in_v
+    inside = float(np.dot(bisector, normals[u])) < 0.0 and (
+        float(np.dot(bisector, normals[v])) < 0.0
+    )
+    return phi if inside else 360.0 - phi
+
+
+def _pair_to_edge(faces: list[list[int]]) -> dict[frozenset[int], tuple[int, int]]:
+    """{(面u, 面v): 共有辺} のマップを作る。"""
+    return {
+        frozenset((u, v)): edge for u, v, edge in build_adjacency_with_edges(faces)
+    }
+
+
+def _fold_axis_2d(
+    polys: list[Polygon], face_id: int, parent_id: int
+) -> list[list[float]] | None:
+    """展開図平面上での折り曲げ軸（2D）を、親面と共有する2頂点から求める。
+
+    共有頂点は「同じ座標を持つ頂点」で照合する。面は独立に計算されるので
+    共有頂点の座標は下位ビットだけずれるので、丸めなしでは一致しない。
+
+    ⚠️ **正規化のあと**に丸める。先に丸めると、展開図が小さいとき
+    異なる頂点が同じキーに潰れて軸が見つからなくなる（実測: scale 1e-9 で
+    box(1,1.5,2) の軸が14本消えた）。
+    """
+    ext = max(
+        max(p.bounds[2] - p.bounds[0], p.bounds[3] - p.bounds[1]) for p in polys
+    )
+    ext = ext or 1.0
+
+    def key(pt: tuple[float, ...]) -> tuple[float, float]:
+        return (
+            round(pt[0] / ext, EDGE_LEN_DECIMALS),
+            round(pt[1] / ext, EDGE_LEN_DECIMALS),
+        )
+
+    parent_pts = {key(c) for c in polys[parent_id].exterior.coords}
+    shared = [c for c in polys[face_id].exterior.coords if key(c) in parent_pts]
+    if len(shared) < 2:
+        return None
+    return [
+        [float(shared[0][0]), float(shared[0][1])],
+        [float(shared[1][0]), float(shared[1][1])],
+    ]
+
+
+class FaceGeometry(NamedTuple):
+    """1 面分の幾何情報。
+
+    JSON のキー名は api_server 側で付ける。純粋な幾何だけをここに置き、
+    「どう JSON に書くか」は持ち込まない。
+    """
+
+    face_id: int
+    parent_id: int | None
+    coords: list[list[float]]
+    fold_axis_3d: list[list[float]] | None
+    fold_axis_2d: list[list[float]] | None
+    dihedral_angle: float | None
+    fold_angle: float | None
+
+
+def face_geometries(
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    normals: list[np.ndarray],
+    tree_edges: list[tuple[int, int]],
+    polys: list[Polygon],
+    pair_to_edge: dict[frozenset[int], tuple[int, int]],
+) -> list[FaceGeometry]:
+    """各面の2D形状・親子関係・折り曲げ軸/角を求める。
+
+    ``tree_edges`` は :func:`layout_parent_relation` と同じ定義で親子を決める。
+    """
+    parents = layout_parent_relation(len(faces), tree_edges)
+
+    out: list[FaceGeometry] = []
+    for face_id, poly in enumerate(polys):
+        x, y = poly.exterior.xy
+        # shapely は末尾に開始点を重複して持つので取り除く
+        coords = [[float(x[i]), float(y[i])] for i in range(len(x) - 1)]
+
+        parent_id = parents[face_id]
+        axis_3d = axis_2d = None
+        dihedral = fold_angle = None
+
+        if parent_id is not None:
+            edge = pair_to_edge.get(frozenset((face_id, parent_id)))
+            if edge is not None:
+                a, b = edge
+                axis_3d = [vertices[a].tolist(), vertices[b].tolist()]
+                axis_2d = _fold_axis_2d(polys, face_id, parent_id)
+                dihedral = _dihedral_deg(vertices, faces, normals, face_id, parent_id)
+                # 平らな展開図を立体に畳み込むのに必要な回転角
+                fold_angle = 180.0 - dihedral
+
+        out.append(
+            FaceGeometry(
+                face_id=face_id,
+                parent_id=parent_id,
+                coords=coords,
+                fold_axis_3d=axis_3d,
+                fold_axis_2d=axis_2d,
+                dihedral_angle=dihedral,
+                fold_angle=fold_angle,
+            )
+        )
+    return out
 
 
 def build_ribbon_graph(

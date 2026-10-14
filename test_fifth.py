@@ -3,6 +3,7 @@
 import itertools
 import math
 import random
+import re
 
 import networkx as nx
 import numpy as np
@@ -195,6 +196,90 @@ def test_orient_faces_outward_points_outward(builder):
     assert _signed_volume(v, faces, normals) > 0
 
 
+def _reference_parents(n_faces, tree_edges):
+    """layout_parent_relation の契約を独立に書き直した実装（比較用）。
+
+    契約: 根は面0。木の無向隣接を幅優先に走査し、
+    最初に訪れた未訪問の隣接面を親とする。根の親は None。
+    """
+    adj = [[] for _ in range(n_faces)]
+    for u, v in tree_edges:
+        adj[u].append(v)
+        adj[v].append(u)
+    parents = [None] * n_faces
+    visited = {0}
+    queue = [0]
+    while queue:
+        u = queue.pop(0)
+        for v in adj[u]:
+            if v not in visited:
+                visited.add(v)
+                parents[v] = u
+                queue.append(v)
+    return parents
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [cube_b, tetrahedron_b, prism4_b, prism5_b, l_shape_b],
+    ids=["cube", "tetra", "prism4", "prism5", "L-shape"],
+)
+def test_layout_parent_relation_matches_its_documented_contract(builder):
+    """契約どおりに書き直した独立実装（比較用）。
+
+    折り曲げ軸は「親と共有する辺」なので、ここが 1 つでも変わると
+    API 応答の ``fold_axis_*`` と ``parent_face_id`` が黙って変わる。
+    layout_tree と二重実装にしないための、意図的に独立した実装との突き合わせ。
+    """
+    _v, f = builder()
+    edges = fifth.build_adjacency_graph(f)
+    trees = list(fifth.enumerate_spanning_trees(edges, len(f)))
+    assert trees  # 立体が空だと空振りになる
+
+    for tree in trees:
+        got = fifth.layout_parent_relation(len(f), tree)
+        assert got == _reference_parents(len(f), tree)
+        assert got[0] is None  # 根の親は None
+        assert all(got[v] is not None for v in range(1, len(f)))
+
+
+def test_layout_tree_and_parent_relation_agree():
+    """layout_tree が親マップの唯一のソースであること。
+
+    BFS 順が違えば回転の伝播順も変わり、展開図自体が変わる。
+    """
+    v, f = prism5_b()
+    normals = fifth.compute_normals(v, f)
+    edges = fifth.build_adjacency_graph(f)
+    prep = fifth.prepare_layout(v, f, normals)
+    for tree in list(fifth.enumerate_spanning_trees(edges, len(f)))[:64]:
+        parents = fifth.layout_parent_relation(len(f), tree)
+        # 各面は親と隣接している = 親マップが実際の隣接と整合している
+        for face_id, parent_id in enumerate(parents):
+            if parent_id is None:
+                continue
+            assert (parent_id, face_id) in edges or (face_id, parent_id) in edges
+        assert len(fifth.layout_tree(v, f, normals, tree, prep)) == len(f)
+
+
+def test_layout_tree_rejects_a_non_spanning_tree():
+    """全域木でない木は面番号を名指しして落ちる（前条件違反の可視化）。"""
+    v, f = cube()
+    normals = fifth.compute_normals(v, f)
+    # (0,2) と (1,3) は立方体の実際の隣接だが、この2本だけでは2成分に分かれる。
+    # 面0 から BFS すると到達できるのは {0,2} だけで、{1,3,4,5} は到達不能。
+    forest = [(0, 2), (1, 3)]
+    adjacency = fifth.build_adjacency_graph(f)
+    assert all((u, v) in adjacency for u, v in forest), "前提: この2本は隣接している"
+
+    with pytest.raises(ValueError, match="へ到達できませんでした") as ei:
+        fifth.layout_tree(v, f, normals, forest)
+
+    # メッセージは到達不能な面の番号を名指しする
+    named = int(re.search(r"面(\d+)", str(ei.value)).group(1))
+    assert named in {1, 3, 4, 5}, named
+
+
 # --------------------------------------------------------------------------
 # 法線・辺マップ・隣接グラフ
 # --------------------------------------------------------------------------
@@ -232,13 +317,11 @@ def test_l_shape_has_a_reflex_dihedral():
 
     法線のなす角だけで求めると 90 度になってしまう（凸な棱しか扱えない）。
     """
-    import api_server
-
     v, f = l_shape()
     faces = fifth.orient_faces_outward(v, f)
     normals = fifth.compute_normals(v, faces)
     dihedrals = [
-        api_server._dihedral_deg(v, faces, normals, u, w)
+        fifth._dihedral_deg(v, faces, normals, u, w)
         for u, w, _ in fifth.build_adjacency_with_edges(faces)
     ]
     assert len(dihedrals) == 18
@@ -259,13 +342,11 @@ def test_l_shape_has_a_reflex_dihedral():
 )
 def test_interior_dihedral_angles(builder, expected):
     """立体の内側の二面角。立方体・三角柱・立方柱・正四面体で検算できる。"""
-    import api_server
-
     v, f = builder()
     faces = fifth.orient_faces_outward(v, f)
     normals = fifth.compute_normals(v, faces)
     got = {
-        round(api_server._dihedral_deg(v, faces, normals, u, w), 6)
+        round(fifth._dihedral_deg(v, faces, normals, u, w), 6)
         for u, w, _ in fifth.build_adjacency_with_edges(faces)
     }
     assert got == {round(d, 6) for d in expected}
@@ -425,7 +506,7 @@ def test_layout_preserves_face_area(builder):
 
 
 def test_cube_layout_keeps_faces_orthogonal():
-    """立方体の隣り合う面は直角に 접している。"""
+    """立方体の隣り合う面は直角に 接している。"""
     v, f = cube()
     normals = fifth.compute_normals(v, f)
     for u, nbrs in enumerate(_neighbors(f)):

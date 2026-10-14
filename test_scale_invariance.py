@@ -7,16 +7,14 @@
 ⚠️ 2つの主張は別物です。混ぜないこと。
 
   * 一意な展開図の**数** … 1e-10 まで検証済み（このファイル）
-  * ``_fold_axis_2d`` の**値** … 1e-8 までしか検証していない
+  * ``_fold_axis_2d`` の**値** … 1e-12 まで検証済み（このファイル）
 
-``_fold_axis_2d`` は2Dレイアウト座標を ``round(9)`` 桁に丸めて頂点を突き合わせる。
-丸め方が絶対精度なので、展開図が大きい立体ほど早く崩れる。数だけのテストが
-1e-10 のレスポンスの正しさまで保証したわけではない。
+どちらも 1e-10 より小さいスケールを断言しているが、
+片方が成立してもう片方が成立する保証はない。
 """
 
 import pytest
 
-import api_server
 import fifth
 import make_nets
 
@@ -141,55 +139,43 @@ def _fold_axes(builder, scale):
         ext = max(
             max(p.bounds[2] - p.bounds[0], p.bounds[3] - p.bounds[1]) for p in polys
         )
-        parent_map = api_server.get_layout_parent_relation(faces, tree)
+        parent_map = fifth.layout_parent_relation(len(faces), tree)
         for face_id, parent_id in enumerate(parent_map):
             if parent_id is None:
                 continue
-            axis = api_server._fold_axis_2d(polys, face_id, parent_id)
+            axis = fifth._fold_axis_2d(polys, face_id, parent_id)
             if axis is None:
                 continue
             axes.append(tuple((round(x / ext, 9), round(y / ext, 9)) for x, y in axis))
     return axes
 
 
+@pytest.mark.parametrize("scale", [1e-9, 1e-10, 1e-12])
 @pytest.mark.parametrize(
     "builder",
     [
         lambda: make_nets.box(1, 1, 1),
         lambda: make_nets.box(1, 1.5, 2),
         make_nets.tetrahedron,
+        lambda: make_nets.prism(3),
         lambda: make_nets.prism(4),
         lambda: make_nets.prism(5),
+        lambda: make_nets.pyramid(4),
+        lambda: make_nets.pyramid(5),
     ],
-    ids=["cube", "box1x1.5x2", "tetra", "prism4", "prism5"],
+    ids=["cube", "box1x1.5x2", "tetra", "prism3", "prism4", "prism5", "pyr4", "pyr5"],
 )
-def test_fold_axis_is_correct_down_to_1e_8(builder):
-    """折り曲げ軸は 1e-8 まで全立体で正しい。
+def test_fold_axis_is_scale_invariant(builder, scale):
+    """折り曲げ軸は 1e-12 まで正しい（PR2 で bbox 正規化を入れてから）。
 
-    ⚠️ v3 計画は「1e-9 まで」と書いたが、実測は 1e-8 が限界だった。
-    ``round(9)`` は2Dレイアウト座標という「展開図の大きさ」に依存する値に
-    絶対精度を掛けているので、立体がデカいほど早く崩れる。
-    box(1,1.5,2)（展開図が大きい）は 1e-9、prism6（最も大きい）も 1e-9 で既に壊れる。
-    つまり 1e-9 は精度の限界ではなく偶然の境界で、この下限は置けない。
+    PR1 の時点では 1e-8 が限界だった。``_fold_axis_2d`` が2Dレイアウト座標に
+    絶対精度の ``round(9)`` を掛けていたため、展開図が物理的に大きい立体ほど
+    早く崩れていた（box(1,1.5,2) は 1e-9 で軸が14本消えていた）。
+
+    正規化を挟むと実測は 1e-14 まで通る。1e-12 まで断言して、
+    1e-10 で確実に壊れないこと（当初の主張）を固定する。
+    1e-16 では一意数自体が変わり始めるので、それ以上は検証しない。
     """
     baseline = _fold_axes(builder, 1.0)
     assert baseline  # 空だと空振りになるので、何か出ていることを明示する
-    assert _fold_axes(builder, 1e-8) == baseline
-
-
-@pytest.mark.xfail(strict=True, reason="既知の未修正バグ。PR2 の bbox 正規化で直る")
-@pytest.mark.parametrize(
-    ("builder", "scale"),
-    [
-        (lambda: make_nets.box(1, 1.5, 2), 1e-9),  # 14本が見つからず、4本が誤り
-        (lambda: make_nets.box(1, 1, 1), 1e-10),  # 41本が誤り
-    ],
-    ids=["box1x1.5x2@1e-9", "cube@1e-10"],
-)
-def test_fold_axis_below_1e_8_is_still_broken(builder, scale):
-    """1e-8 より小さいと ``_fold_axis_2d`` が壊れることを、.Rectangle として固定する。
-
-    strict=True なので PR2 が bbox 正規化を入れて直すと **このテストが落ちる**。
-    つまり「直ったら xfail を消す」という合図であり、修正を忘れないまま残せる。
-    """
-    assert _fold_axes(builder, scale) == _fold_axes(builder, 1.0)
+    assert _fold_axes(builder, scale) == baseline
