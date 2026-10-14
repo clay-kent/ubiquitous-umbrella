@@ -7,6 +7,19 @@ import numpy as np
 import shapely
 from shapely.geometry import Polygon
 
+# 辺長の正規化後の丸め桁数。10 桁だと浮動小数点の最後のビット差を
+# 同一視できず、9 桁で「同じ辺長は必ず同じ色」に収まる。
+EDGE_LEN_DECIMALS = 9
+
+# 面法線の退化管理の相対許容値。面積(長さ^2)と同じ単位なので座標スケール^2 を掛ける。
+# 絶対値 1e-12 だと辺長 1e-7 以下の正当な立体を退化和誤判定する。
+FACE_NORMAL_REL_TOL = 1e-12
+
+# 重なり判定の相対許容値（2つの面の和集合 bbox の対角の長さ^2 に対する比）。
+# 精度指定ではなく「実重なりと浮動ノイズの間の空白に置く」ための値。
+# 実測: 実重なりは最小 1.0、ダストは 1e-9 未満なので 9 桁の余裕がある。
+OVERLAP_AREA_REL_TOL = 1e-7
+
 
 class SolidError(ValueError):
     """入力された立体が不正なときに投げられる。
@@ -249,7 +262,11 @@ def face_normal(vertices: np.ndarray, face: list[int]) -> np.ndarray:
         acc[1] += (a[2] - b[2]) * (a[0] + b[0])
         acc[2] += (a[0] - b[0]) * (a[1] + b[1])
     norm = np.linalg.norm(acc)
-    if norm < 1e-12:
+    # acc は面積（長さ^2）の単位なので、許容値にも座標スケール^2 を掛ける。
+    # 絶対値の閾値を置くと辺長 1e-7 以下の正当な立体を「退化した」と誤判定する。
+    # max(1.0, s) の下限は置かない。小さいスケールを 1.0 の床に貼り付けてしまう。
+    s = float(np.max(np.abs(vertices)))
+    if norm < FACE_NORMAL_REL_TOL * s * s:
         raise SolidError("degenerate_face", "退化した面（面積ゼロ）が検出されました。")
     return acc / norm
 
@@ -464,7 +481,16 @@ def is_valid_layout(polygons) -> bool:
             # 外接矩形が重ならなければ交差面積も 0 なので交差計算を省略できる
             if ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0:
                 continue
-            if polygons[i].intersection(polygons[j]).area > 1e-4:
+            # 閾値を面積の絶対値にすると、立体が小さいと実重なりを見落とす。
+            # 2つの面の和集合の外接矩形の対角の長さ^2 を基準にした比で判定する。
+            # 和集合を使うのは「接しているだけ」のとき交差側の幅が0になり、
+            # 閾値も0になって浮動ノイズを実重なりと誤判定するため。
+            dx = max(ax1, bx1) - min(ax0, bx0)
+            dy = max(ay1, by1) - min(ay0, by0)
+            if (
+                polygons[i].intersection(polygons[j]).area
+                > OVERLAP_AREA_REL_TOL * (dx * dx + dy * dy)
+            ):
                 return False
     return True
 
@@ -582,7 +608,7 @@ class RibbonContext:
 
         nodes: list[tuple[int, int]] = []
         nxt: list[int] = []
-        edge_len: list[float] = []
+        raw_len: list[float] = []
         node_id: list[list[int]] = []
         idx_map: list[dict[frozenset[int], int]] = []
         for f_idx, face in enumerate(faces):
@@ -594,20 +620,21 @@ class RibbonContext:
                 m.setdefault(frozenset((face[i], face[(i + 1) % k])), i)
                 row.append(base + i)
                 nodes.append((f_idx, i))
-                edge_len.append(
-                    round(
-                        float(
-                            np.linalg.norm(
-                                vertices[face[i]] - vertices[face[(i + 1) % k]]
-                            )
-                        ),
-                        5,
+                raw_len.append(
+                    float(
+                        np.linalg.norm(vertices[face[i]] - vertices[face[(i + 1) % k]])
                     )
                 )
             for i in range(k):
                 nxt.append(row[(i + 1) % k])
             node_id.append(row)
             idx_map.append(m)
+
+        # 辺長は「最大の辺長を1とする比」で持つ。座標のスケールに依存させては
+        # いけないので、丸める前の値で最大を取り、正規化してから丸める。
+        # 順序を逆にすると 1e-5 程度の立体では全辺が同じ値に潰れて情報が消える。
+        mx = max(raw_len)
+        edge_len = [round(e / mx, EDGE_LEN_DECIMALS) for e in raw_len]
 
         self.n_nodes = len(nodes)
         self.nxt = nxt

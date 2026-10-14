@@ -21,3 +21,8 @@ dev = [
     "types-networkx>=3.6.1.20260612",
     "types-shapely>=2.1.0.20260603",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: 数秒かかる重いケース。`-m 'not slow'` で除外できる",
+]
