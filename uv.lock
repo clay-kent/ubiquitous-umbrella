@@ -647,7 +647,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "matplotlib" },
-    { name = "networkx" },
     { name = "numpy" },
     { name = "shapely" },
     { name = "uvicorn" },
@@ -657,6 +656,7 @@ dependencies = [
 dev = [
     { name = "httpx2" },
     { name = "mypy" },
+    { name = "networkx" },
     { name = "pytest" },
     { name = "types-networkx" },
     { name = "types-shapely" },
@@ -666,7 +666,6 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.139.0" },
     { name = "matplotlib", specifier = ">=3.10" },
-    { name = "networkx", specifier = ">=3.6.1" },
     { name = "numpy", specifier = ">=2.5.0" },
     { name = "shapely", specifier = ">=2.1.2" },
     { name = "uvicorn", specifier = ">=0.35" },
@@ -676,6 +675,7 @@ requires-dist = [
 dev = [
     { name = "httpx2", specifier = ">=2.13.1" },
     { name = "mypy", specifier = ">=2.1.0" },
+    { name = "networkx", specifier = ">=3.6.1" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "types-networkx", specifier = ">=3.6.1.20260612" },
     { name = "types-shapely", specifier = ">=2.1.0.20260603" },
