@@ -1,8 +1,18 @@
-fastapi
-uvicorn
-shapely
-numpy
-matplotlib
-networkx
-pytest
-httpx2
+# 自動生成 — 手編集しないこと。
+# 正となるのは pyproject.toml / uv.lock で、ここは pip install -r 用の派生。
+# tools/sync_requirements.py が生成する（pre-commit で自動同期）。
+
+# --- runtime ---
+fastapi>=0.139.0
+matplotlib>=3.10
+numpy>=2.5.0
+shapely>=2.1.2
+uvicorn>=0.35
+
+# --- dev ---
+httpx2>=2.13.1
+mypy>=2.1.0
+networkx>=3.6.1
+pytest>=9.1.1
+types-networkx>=3.6.1.20260612
+types-shapely>=2.1.0.20260603

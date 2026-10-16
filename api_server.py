@@ -7,6 +7,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
+from shapely.geometry import Polygon
 
 import fifth
 
@@ -128,9 +129,9 @@ def _face_geometry(
     faces: list[list[int]],
     normals: list[np.ndarray],
     tree_edges: list[tuple[int, int]],
-    polys: list,
+    polys: list[Polygon],
     pair_to_edge: dict[frozenset[int], tuple[int, int]],
-) -> list[dict]:
+) -> list[dict[str, object]]:
     """各面の2D形状・親子関係・折り曲げ軸/角を JSON 化可能な形にする。
 
     幾何の計算そのものは ``fifth.face_geometries`` にあり、ここは
@@ -195,7 +196,7 @@ def _build_solid(req: SolidRequest) -> tuple[np.ndarray, list[list[int]]]:
     summary="任意多面体の展開図を上位n個返す",
     responses={422: ERROR_RESPONSE},
 )
-def calculate_nets(req: SolidRequest):
+def calculate_nets(req: SolidRequest) -> dict[str, object]:
     """任意の多面体を受け取り、重なりのない展開図を評価指標の良い順に n 個返す。"""
     vertices, faces = _build_solid(req)
     n_faces = len(faces)
@@ -234,7 +235,7 @@ def calculate_nets(req: SolidRequest):
     shared_of = fifth.build_shared_of(faces)
     pair_to_edge = fifth._pair_to_edge(faces)
 
-    def metrics_json(m: fifth.NetMetrics) -> dict:
+    def metrics_json(m: fifth.NetMetrics) -> dict[str, object]:
         """NamedTuple はそのままだと JSON の配列になるので、応答の形に戻す。
 
         指標の**計算**は fifth.net_metrics に一本化し、

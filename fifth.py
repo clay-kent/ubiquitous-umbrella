@@ -1,6 +1,6 @@
 import math
 from collections.abc import Iterable, Iterator
-from typing import NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import shapely
@@ -26,6 +26,17 @@ OVERLAP_AREA_REL_TOL = 1e-7
 # （以前は「超えたら 1 枚捨てて VF2 同型判定に回る」フォールバックがあるが、
 #   1500 倍の余裕に対して発動しない＝死んだ経路であり、消した）。
 SEARCH_BUDGET = 200_000
+
+# 色細分における「1 つの色」。初期値は (辺長, 接着の有無, 接着の向き) の
+# タプルで、1 回目の細分で hash() の結果（int）に置き換わり、その後は
+# 個別化でさらに int が挿入される。つまり**実行時に型が変わる**ので、
+# 和集合で書くより Any のほうが正直。
+Color = Any
+
+# prepare_layout の戻り値。6 つのキーをまとめた dict で、使う側ごとに
+# 必要なキーだけ引く。クラス化しても実際の問題は解決しないので dict のまま。
+# 实际问题はないので dict のままにする。
+Layout = dict[str, Any]
 
 
 class SolidError(ValueError):
@@ -405,7 +416,7 @@ def build_shared_of(faces: list[list[int]]) -> dict[tuple[int, int], tuple[int, 
 
 def prepare_layout(
     vertices: np.ndarray, faces: list[list[int]], normals: list[np.ndarray]
-) -> dict:
+) -> Layout:
     """layout_tree の呼び出しごとに変わらない前計算をまとめる。
 
     全域木1つにつき1回しか使わない値だが、候補が数千本あるため先にまとめておく。
@@ -478,7 +489,7 @@ def layout_tree(
     faces: list[list[int]],
     normals: list[np.ndarray],
     tree_edges: list[tuple[int, int]],
-    precomputed: dict | None = None,
+    precomputed: Layout | None = None,
 ) -> list[Polygon]:
     """全域木に基づいて面を展開し、ShapelyのPolygonリスト（2D座標系）を返す。
 
@@ -566,7 +577,7 @@ def layout_tree(
     return [Polygon(c) for c in coords]
 
 
-def is_valid_layout(polygons) -> bool:
+def is_valid_layout(polygons: list[Polygon]) -> bool:
     """展開図のポリゴン間に重なり（衝突）がないかを検証する。
 
     外面の数が少ないので、空間索引（STRtree）よりも外接矩形で絞り込んだほうが
@@ -891,7 +902,9 @@ def _glue_arrays(
     return partner, flip
 
 
-def _wl_refine(nxt: list[int], partner: list[int], flip: list[bool], color: list) -> list:
+def _wl_refine(
+    nxt: list[int], partner: list[int], flip: list[bool], color: list[Color]
+) -> list[Color]:
     """色細分（1-WL）。分割が安定するまで繰り返す。
 
     細分化しか起きないため「色数が変わらなくなった」時点で安定している。
@@ -917,9 +930,9 @@ def _individualize_refine(
     nxt: list[int],
     partner: list[int],
     flip: list[bool],
-    color: list,
+    color: list[Color],
     budget: list[int],
-) -> tuple:
+) -> tuple[Color, ...]:
     """個別化-細分による正規形。
 
     予算超過時は ``None`` を返さず ``SolidError`` を投げる。
@@ -940,28 +953,38 @@ def _individualize_refine(
         # 全ての半辺が別々の色になった = 色列そのものが完全な同型判定になる
         return tuple(sorted(color))
 
-    cells: dict = {}
+    cells: dict[Color, list[int]] = {}
     for i, c in enumerate(color):
         cells.setdefault(c, []).append(i)
     multi = {c: members for c, members in cells.items() if len(members) > 1}
     if not multi:
         return tuple(sorted(color))
 
-    # 色の値が最小のセルを1つ選んで個別化する（この選択は同型で変わらない）
-    target = min(multi)
-    best: tuple | None = None
-    for v in multi[target]:
+    # 色の値が最小のセルを1つ選んで個別化する（この選択は同型で変わらない）。
+    # members は必ず2要素以上（multi に入るのは len>1 のセルだけ）なので、
+    # 先頭の要素で初期化してから残りを試せる。Optional を持ち回る必要はない。
+    members = multi[min(multi)]
+
+    def individualise(v: int) -> list[Color]:
         branch = list(color)
         branch[v] = min(color) - 1  # 既存の色と衝突しない新しい色
-        got = _individualize_refine(nxt, partner, flip, branch, budget)
-        if best is None or got < best:
+        return branch
+
+    best = _individualize_refine(
+        nxt, partner, flip, individualise(members[0]), budget
+    )
+    for v in members[1:]:
+        got = _individualize_refine(
+            nxt, partner, flip, individualise(v), budget
+        )
+        if got < best:
             best = got
     return best
 
 
 def _net_signature(
     ctx: RibbonContext, tree_edges: list[tuple[int, int]]
-) -> tuple:
+) -> tuple[Color, ...]:
     """展開図の正規形（同型なら必ず一致するキー）。
 
     個別化-細分が全ての半辺を区別できた場合、その色は完全な同型判定になる。
@@ -992,7 +1015,7 @@ def iter_unique_nets(
     mirror_ctx = RibbonContext(vertices, [list(reversed(f)) for f in faces])
     layout_prep = prepare_layout(vertices, faces, normals)
 
-    exact_seen: set[tuple] = set()
+    exact_seen: set[tuple[Color, ...]] = set()
 
     for tree in all_trees:
         # レイアウトより先に重複を判定する。

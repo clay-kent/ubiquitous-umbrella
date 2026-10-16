@@ -769,8 +769,8 @@ def test_errors_inside_the_tree_loop_propagate():
 def test_search_budget_exceeded_raises_a_named_solid_error():
     """予算超過は ``None`` ではなく ``SolidError('search_budget_exceeded')``。
 
-    ``None`` を返すと VF2 に落ち 있었いので、その戻り値を誰かが
-    ``None`` を返すとフォールバックに落ちていたが、その戻り値を
+    ``None`` を返すとフォールバック（現在は無い）に落ちていたが、
+    その戻り値を「重複」と誤解すると誤った一意数になる。
     API ではこの例外が 422 の ``type: "search_budget_exceeded"`` になる。
     """
     ctx = fifth.RibbonContext(

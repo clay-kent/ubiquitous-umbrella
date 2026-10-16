@@ -28,3 +28,11 @@ dev = [
 markers = [
     "slow: 数秒かかる重いケース。`-m 'not slow'` で除外できる",
 ]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["fifth.py", "api_server.py", "make_nets.py"]
+strict = true
+# networkx は本体から消えた（PR4 で VF2 を削除、dev 専用にした）。
+# テスト側にある _brute_force_trees だけが使うので、
+# 本体の型検査には現れない。
