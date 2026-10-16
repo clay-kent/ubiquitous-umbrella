@@ -262,6 +262,38 @@ def test_layout_tree_and_parent_relation_agree():
         assert len(fifth.layout_tree(v, f, normals, tree, prep)) == len(f)
 
 
+def _bowtie():
+    """2つの立方体が頂点1つを共有する立体。
+
+    座標は 15 個だが頂点インデックスは 16 個ある。面はインデックスで
+    頂点を指すので、同じ点に2枚の状態が被ってしまう。
+    """
+    v, f = cube()
+    v2 = v + np.array([1.0, 0.0, 0.0])  # 頂点 (1,0,0) を共有する
+    return np.vstack([v, v2]), f + [[i + 8 for i in face] for face in f]
+
+
+def test_duplicate_vertex_is_rejected():
+    """同じ座標を持つ頂点は不受当（2つの立方体が頂点1つを共有する bowtie）。"""
+    v, f = _bowtie()
+    with pytest.raises(ValueError) as ei:
+        fifth.validate_solid(v, f)
+    assert getattr(ei.value, "code", None) == "duplicate_vertex"
+
+
+def test_duplicate_coordinates_are_reported_before_non_planarity():
+    """頂点の重複は ``non_planar_face`` より先に報告される。
+
+    重複座標の頂点を含む面は平面でなくなるので、順序を逆にすると利用者は
+    「平面にするには？」という誤った結論に誘導される。
+    """
+    v, f = cube()
+    v[7] = v[0]  # 頂点7 を 頂点0 と同じ座標にする（面インデックスは別）
+    with pytest.raises(ValueError) as ei:
+        fifth.validate_solid(v, f)
+    assert ei.value.code == "duplicate_vertex"
+
+
 def test_orient_faces_outward_rejects_boundary_input_loudly():
     """前条件を破った入力は黙って無視せず ValueError になる。
 

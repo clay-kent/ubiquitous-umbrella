@@ -74,6 +74,20 @@ def validate_solid(
     if n_f < 4:
         raise SolidError("too_few_faces", "立体には4面以上が必要です。")
 
+    # 同じ座標を持つ頂点が別インデックスで存在する。
+    # 面はインデックスで頂点を指すので、重複頂点は「同じ点に2枚の状態が被る」ことになり、
+    # 面の隣接グラフが定義したものと食い違って非連結に見える。
+    # 頂点を1つに統合してから入力しなければならない。
+    #
+    # これを先に弾かないと、原因と無関係な downstream のエラー
+    # （例: 重複頂点を含む面が non_planar_face になる、bowtie が not_connected になる）
+    # が返って、利用者は原因を推測できません。
+    if len(np.unique(vertices, axis=0)) != n_v:
+        raise SolidError(
+            "duplicate_vertex",
+            "同じ座標を持つ頂点が複数あります。頂点を1つにまとめてください。",
+        )
+
     # 全頂点が原点なら zero_length_edge が先に弾くので 0 にはならない。
     scale = float(np.max(np.abs(vertices)))
     for f_idx, face in enumerate(faces):

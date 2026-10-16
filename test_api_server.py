@@ -544,9 +544,18 @@ def test_non_planar_face_is_rejected():
 
 
 def test_disconnected_solid_is_rejected():
-    """面が2つの離れた立方体だと、展開図を構成できない。"""
+    """面が2つの離れた立方体だと、展開図を構成できない。
+
+    ⚠️ 2つめは必ず平行移動して**完全に離す**こと。
+    ``cube_body(5,5,5)`` は原点を据えたまま伸ばすので、頂点 (0,0,0) を
+    1つめの立方体と共有してしまう。それは ``duplicate_vertex`` の用例であり
+    本テストの意図（離れた2成分）ではない。
+    なお共有頂点のままでは、かつて本テストは `not_connected` を期待していた
+    が、実際には `duplicate_vertex` が正しい分類。
+    """
     a = cube_body()
-    b = cube_body(5.0, 5.0, 5.0)
+    b = cube_body()
+    b["vertices"] = [[x + 10, y, z] for x, y, z in b["vertices"]]
     merged = {
         "vertices": a["vertices"] + b["vertices"],
         "faces": a["faces"] + [[i + 8 for i in f] for f in b["faces"]],
@@ -554,6 +563,23 @@ def test_disconnected_solid_is_rejected():
     r = post(merged)
     assert r.status_code == 422
     assert "連結" in detail_msg(r)
+
+
+def test_cubes_sharing_only_a_vertex_are_duplicate_vertex_not_disconnected():
+    """頂点1つだけを共有する2つの立方体。
+
+    共有頂点があるので隣接グラフが非連結に見えるが、本質は頂点の重複。
+    ``not_connected`` と返すと利用者に「面を削れ」と誤誘導する。
+    """
+    a = cube_body()
+    b = cube_body(5.0, 5.0, 5.0)  # 原点から伸ばすので (0,0,0) を共有する
+    merged = {
+        "vertices": a["vertices"] + b["vertices"],
+        "faces": a["faces"] + [[i + 8 for i in f] for f in b["faces"]],
+    }
+    r = post(merged)
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["type"] == "duplicate_vertex"
 
 
 def test_too_many_spanning_trees_is_rejected():
@@ -821,6 +847,47 @@ def test_search_budget_exceeded_returns_a_422_with_a_branchable_type():
     assert detail[0]["type"] == "search_budget_exceeded"
     assert detail[0]["loc"] == ["body"]
     assert "面の数を減らしてください" in detail[0]["msg"]
+
+
+def _bowtie_body():
+    """2つの立方体が頂点1つを共有する body（頂点16個 / 座標15個）。"""
+    v = [
+        [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+        [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+    ]
+    v2 = [[x + 1, y, z] for x, y, z in v]
+    f = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
+         [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+    return {
+        "vertices": v + v2,
+        "faces": f + [[i + 8 for i in face] for face in f],
+    }
+
+
+def test_bowtie_returns_422_duplicate_vertex():
+    """bowtie は 422 ``duplicate_vertex``。
+
+    以前は ``validate_solid`` を通過し、あとから面の非連結として
+    ``not_connected`` が返っていた。どちらの ``type`` も 422 で、
+    **受理される範囲は変わらない**。変わったのは分類とメッセージだけ。
+    """
+    r = client.post(URL, json=_bowtie_body())
+    assert r.status_code == 422, r.text[:400]
+    detail = r.json()["detail"]
+    assert detail[0]["type"] == "duplicate_vertex"
+    assert "頂点" in detail[0]["msg"]
+
+
+def test_duplicate_vertex_is_a_distinguishable_type():
+    """``duplicate_vertex`` は既存の分類と混ざらない。
+
+    クライアントが ``not_connected`` と取り違えて「面を削れ」と案内することを
+    防げる。
+    """
+    r = client.post(URL, json=_bowtie_body())
+    types = {e["type"] for e in r.json()["detail"]}
+    assert types == {"duplicate_vertex"}
+    assert "not_connected" not in types
 
 
 # --------------------------------------------------------------------------
