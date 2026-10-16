@@ -224,9 +224,9 @@ def calculate_nets(req: SolidRequest):
         all_trees = fifth.enumerate_spanning_trees(edges, n_faces)
         normals = fifth.compute_normals(vertices, faces)
         unique = list(fifth.iter_unique_nets(vertices, faces, all_trees, normals))
-    except HTTPException:
-        raise
     except fifth.SolidError as exc:
+        # 上の _error(...) は HTTPException で、ValueError ではないので
+        # 下の except ValueError に飲まれない。再raise句は不要。
         raise _error(exc.code, str(exc)) from exc
     except ValueError as exc:
         raise _error("invalid_solid", str(exc)) from exc

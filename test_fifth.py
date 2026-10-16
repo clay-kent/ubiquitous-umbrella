@@ -262,6 +262,26 @@ def test_layout_tree_and_parent_relation_agree():
         assert len(fifth.layout_tree(v, f, normals, tree, prep)) == len(f)
 
 
+def test_orient_faces_outward_rejects_boundary_input_loudly():
+    """前条件を破った入力は黙って無視せず ValueError になる。
+
+    ``orient_faces_outward`` から削除した ``if len(holders) != 2: continue``
+    は、``validate_solid`` を先に通，才有この関数の到達不能な守護が存在する前提の守護だった。
+    守護を外したので、破ったときはタプル展開が ValueError として現れる。
+    このテストはその契約が文書どおりであることを固定する。
+    """
+    v, f = cube()
+    # 側面を1枚外すと境界（非多様体）になる。validate_solid は弾く。
+    open_faces = f[:4]
+    with pytest.raises(ValueError, match="共有"):
+        fifth.validate_solid(v, open_faces)
+
+    # validate_solid を飛ばして orient_faces_outward に渡すと、
+    # 黙って無視されるのではなく ValueError で落ちる（=見える失敗）。
+    with pytest.raises(ValueError):
+        fifth.orient_faces_outward(v, open_faces)
+
+
 def test_layout_tree_rejects_a_non_spanning_tree():
     """全域木でない木は面番号を名指しして落ちる（前条件違反の可視化）。"""
     v, f = cube()
@@ -763,12 +783,6 @@ def test_budget_headroom_is_large():
 
         assert 0 < peak["v"] < fifth.SEARCH_BUDGET / 100, (builder, peak["v"])
 
-
-def test_generate_unfolding_nets_end_to_end():
-    v, f = cube()
-    nets = fifth.generate_unfolding_nets(v, f)
-    assert len(nets) == 11
-    assert all(len(polys) == 6 for polys in nets)
 
 
 def test_net_signature_merges_mirror_images():

@@ -1,8 +1,6 @@
-import io
 import math
-import sys
 from collections.abc import Iterable, Iterator
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import numpy as np
 import shapely
@@ -76,7 +74,8 @@ def validate_solid(
     if n_f < 4:
         raise SolidError("too_few_faces", "立体には4面以上が必要です。")
 
-    scale = float(np.max(np.abs(vertices))) or 1.0
+    # 全頂点が原点なら zero_length_edge が先に弾くので 0 にはならない。
+    scale = float(np.max(np.abs(vertices)))
     for f_idx, face in enumerate(faces):
         if len(face) < 3:
             raise SolidError("face_too_few_vertices", f"面{f_idx} の頂点数が3未満です。")
@@ -327,7 +326,12 @@ def orient_faces_outward(
     """面の巻き順を「外向き・互いに整合」に正規化して返す。
 
     呼び出し側が巻き順（Hole の向き）を意識しなくて済むようにする。
-    非可向きの立体は ValueError。
+
+    **前条件**: 呼び出し側は先に :func:`validate_solid` を通していること。
+    各辺がちょうど2面に共有される保証はそこに閉じている。
+    これを破った入力（境界あり・非多様体）は下のタプル展開が
+    ``ValueError: too many values to unpack`` になる。黙って無視しない。
+    非可向きの立体は従来どおり ``SolidError("non_orientable")``。
     """
     oriented = [list(f) for f in faces]
     edge_map = build_edge_map(faces)
@@ -346,8 +350,6 @@ def orient_faces_outward(
         return parent[x], parity[x]
 
     for holders in edge_map.values():
-        if len(holders) != 2:
-            continue
         (f1, d1), (f2, d2) = holders
         # 両面が同じ向きに通っているなら、ちょうど片方を裏返す必要がある
         need_flip = 1 if d1 == d2 else 0
@@ -538,11 +540,15 @@ def layout_tree(
         coords.append(np.column_stack([coords_x, coords_y]))
 
     if precomputed["uniform_ring"]:
-        # 頂点数が揃っていればまとめて作ると Polygon() を1つずつ呼ぶより速い
-        rings = shapely.polygons(shapely.linearrings(np.stack(coords)))
-        if isinstance(rings, Polygon):
-            return [rings]
-        return list(rings)
+        # 頂点数が揃っていればまとめて作ると Polygon() を1つずつ呼ぶより速い。
+        # 面数は validate_solid で 4 以上なので、shapely.polygons は常に
+        # GeometryArray を返す（Polygon 単体分岐は取り除いた）。
+        # その保証は実行時のものなので、型消去は cast で明示する。
+        built = cast(
+            list[Polygon],
+            shapely.polygons(shapely.linearrings(np.stack(coords))),
+        )
+        return list(built)
     return [Polygon(c) for c in coords]
 
 
@@ -609,10 +615,9 @@ def net_metrics(
 
     glued = 0.0
     for u, v in tree_edges:
-        edge = shared_of.get((u, v))
-        if edge is not None:
-            a, b = edge
-            glued += float(np.linalg.norm(vertices[a] - vertices[b]))
+        # tree_edges は build_adjacency_graph 由来なので共有辺は必ず存在する。
+        a, b = shared_of[(u, v)]
+        glued += float(np.linalg.norm(vertices[a] - vertices[b]))
 
     return NetMetrics(
         bounding_box_width=float(bbox_w),
@@ -658,10 +663,8 @@ def _dihedral_deg(
     )
     j = (i + 1) % n_u
     t = vertices[faces[u][j]] - vertices[faces[u][i]]
-    norm_t = float(np.linalg.norm(t))
-    if norm_t == 0.0:
-        return 0.0
-    t = t / norm_t
+    # 長さ0の辺は validate_solid の zero_length_edge が先に弾くので、ここは 0 にならない。
+    t = t / np.linalg.norm(t)
 
     in_u = np.cross(normals[u], t)   # 面 u の内側（立体側）を指す
     in_v = -np.cross(normals[v], t)  # 面 v の内側。面 v では棱を逆向きに歩く
@@ -756,14 +759,14 @@ def face_geometries(
         dihedral = fold_angle = None
 
         if parent_id is not None:
-            edge = pair_to_edge.get(frozenset((face_id, parent_id)))
-            if edge is not None:
-                a, b = edge
-                axis_3d = [vertices[a].tolist(), vertices[b].tolist()]
-                axis_2d = _fold_axis_2d(polys, face_id, parent_id)
-                dihedral = _dihedral_deg(vertices, faces, normals, face_id, parent_id)
-                # 平らな展開図を立体に畳み込むのに必要な回転角
-                fold_angle = 180.0 - dihedral
+            # 親子関係は tree_edges（= 面グラフの全域木）から来るので、
+            # 親とこの面は必ず隣接し、共有辺が必ず存在する。
+            a, b = pair_to_edge[frozenset((face_id, parent_id))]
+            axis_3d = [vertices[a].tolist(), vertices[b].tolist()]
+            axis_2d = _fold_axis_2d(polys, face_id, parent_id)
+            dihedral = _dihedral_deg(vertices, faces, normals, face_id, parent_id)
+            # 平らな展開図を立体に畳み込むのに必要な回転角
+            fold_angle = 180.0 - dihedral
 
         out.append(
             FaceGeometry(
@@ -857,9 +860,8 @@ def _glue_arrays(
     flip = [False] * n_nodes
 
     for u, v in tree_edges:
-        edge = ctx.shared.get((u, v))
-        if edge is None:
-            continue
+        # tree_edges は面グラフの全域木なので、(u, v) は必ず隣接する。
+        edge = ctx.shared[(u, v)]
         iu = ctx.idx_map[u][edge]
         iv = ctx.idx_map[v][edge]
         nu = ctx.node_id[u][iu]
@@ -998,87 +1000,3 @@ def iter_unique_nets(
         if not is_valid_layout(polys):
             continue
         yield tree, polys
-
-
-def generate_unfolding_nets(
-    vertices: np.ndarray | list[list[float]], faces: list[list[int]]
-) -> list[list[Polygon]]:
-    """正規形（同型なら必ず一致するキー）で一意な展開図を生成する。"""
-    vertices = np.array(vertices, dtype=float)
-    n_faces = len(faces)
-
-    if n_faces < 4:
-        raise SolidError("too_few_faces", "多面体は少なくとも4つ以上の面を持つ必要があります。")
-
-    edges = build_adjacency_graph(faces)
-    all_trees = enumerate_spanning_trees(edges, n_faces)
-    normals = compute_normals(vertices, faces)
-
-    return [polys for _, polys in iter_unique_nets(vertices, faces, all_trees, normals)]
-
-
-if __name__ == "__main__":
-    # 出力をUTF-8に変更 (Windows/CP932環境での文字化け対策)
-    if isinstance(sys.stdout, io.TextIOWrapper):
-        sys.stdout.reconfigure(encoding="utf-8")
-
-    # --- 1. 立方体 ---
-    cube_vertices = np.array(
-        [
-            [0, 0, 0],
-            [1, 0, 0],
-            [1, 1, 0],
-            [0, 1, 0],
-            [0, 0, 1],
-            [1, 0, 1],
-            [1, 1, 1],
-            [0, 1, 1],
-        ],
-        dtype=float,
-    )
-    cube_faces = [
-        [0, 3, 2, 1],  # 底面
-        [4, 5, 6, 7],  # 上面
-        [0, 1, 5, 4],  # 前面
-        [1, 2, 6, 5],  # 右面
-        [2, 3, 7, 6],  # 後面
-        [3, 0, 4, 7],  # 左面
-    ]
-
-    # --- 2. 正四面体 ---
-    tetra_vertices = np.array(
-        [[1.0, 1.0, 1.0], [1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0]],
-        dtype=float,
-    )
-    tetra_faces = [[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]]
-
-    # --- 3. 四角錐 ---
-    pyramid_vertices = np.array(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.5, 0.5, 1.0],
-        ],
-        dtype=float,
-    )
-    pyramid_faces = [
-        [0, 3, 2, 1],  # 底面
-        [0, 1, 4],  # 側面1
-        [1, 2, 4],  # 側面2
-        [2, 3, 4],  # 側面3
-        [3, 0, 4],  # 側面4
-    ]
-
-    shapes = {
-        "立方体": (cube_vertices, cube_faces),
-        "正四面体": (tetra_vertices, tetra_faces),
-        "四角錐": (pyramid_vertices, pyramid_faces),
-    }
-
-    for name, (verts, fcs) in shapes.items():
-        nets = generate_unfolding_nets(verts, fcs)
-        print(f"--- {name} ---")
-        print(f"面の数: {len(fcs)}")
-        print(f"一意な展開図の数: {len(nets)}\n")
