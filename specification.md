@@ -40,7 +40,9 @@
 
 *   `build_edge_map(faces)` — 辺ごとの所有面。ちょうど 2 面に共有される辺のみが内部棱となり、それ以外（1 面のみ・3 面以上）は 422 とする。
 *   `build_adjacency_graph(faces)` — 面グラフの辺リスト `[(u, v), ...]`。共有辺 1 本につき 1 エントリ。
-*   `orient_faces_outward(vertices, faces)` — 差分集合で連結成分をまとめ、符号付き体積で外向きに正規化する。呼び出し側の巻き順は問わない。
+*   `orient_faces_outward(vertices, faces)` — **parity union-find** で「各辺を逆向きに 2 面が通る」制約を解き、整合する面だけ裏返す。その後、符号付き体積が負なら全体を裏返して外向きにする。呼び出し側の巻き順は問わない。整合化できない（非可向き）場合は 422。
+    *   面の巻き順が正しければ何もしない。混在していれば矛盾する面だけを裏返す。
+    *   **前条件**: `validate_solid` を先に通していること。辺がちょうど 2 面に共有される保証はそこに閉じている。前条件を破った入力はタプル展開が `ValueError` になる（黙って無視しない）。
 
 ### 3.2 リクエストスキーマ
 
@@ -255,6 +257,7 @@
 | 頂点インデックスが `vertices` の長さを超える | `vertex_index_out_of_range` | 参照範囲外 |
 | 同じ面に同じ頂点が 2 回以上現れる | `duplicate_face_vertex` | エッジにならない |
 | **異なる頂点が同じ座標を持つ** | `duplicate_vertex` | 面はインデックスで頂点を指すので、同じ点に2枚の状態が被り、隣接グラフが定義と食い違う |
+| 1つの面の頂点数が 3 未満 | `face_too_few_vertices` | 面が定義できない（多角形として閉じていない） |
 | 面の中に長さ 0 の辺がある | `zero_length_edge` | 法線が定義できない |
 | 面の頂点が同一平面上にない | `non_planar_face` | 面が定義できない |
 | ある辺を 1 面しか共有しない | `boundary_or_non_manifold` | 表面が閉じておらず（境界がある）、展開図を構成できない |
@@ -265,11 +268,17 @@
 | 面の向きを外向きに揃えられない | `non_orientable` | 非可向きの立体 |
 | 面の連結成分が 2 つ以上ある | `not_connected` | 離れた立体は 1 枚の展開図にできない |
 | 座標に NaN / Infinity | `non_finite_vertex` | 幾何計算が成立しない |
+| `vertices` が `[[x, y, z], ...]` の形式でない（幅が3でない矩形配列など） | `vertices_shape` | 頂点として解釈できない |
+| `vertices` が数値の配列として解釈できない（要素数が揃っていないなど） | `vertices_invalid` | 座標の型が不正 |
+| 上のどれにも当てはまらない `ValueError` | `invalid_solid` | 最終受け皿。具体的な到達経路は未確認（v3 PR4/5 の削除後にほぼ到達しない） |
+| 同型判定が計算量の上限（`SEARCH_BUDGET`）を超えた | `search_budget_exceeded` | **入力は正当**。面の数が多すぎるため計算を打ち切る（4.2） |
 | 全域木が 10,000 本超 | `too_many_spanning_trees` | 列挙前に上限を検出して 422（例: 7 角柱）。**入力は正当**（4.2） |
-| `top_n` / `sort_by` が範囲外 | Pydantic の型名（例 `greater_than`） | 仕様違反 |
+| `top_n` / `sort_by` が範囲外 | Pydantic の型名（例 `greater_than_equal`） | 仕様違反 |
 | 未知のフィールド名 | `extra_forbidden` | typo や旧仕様フィールドを黙って捨てないため |
 
 **凹角（非凸）は 422 にしない。** L 字柱や貫通穴つきの立体（genus > 0）は正当な入力として受理する。
+
+**NaN / Infinity は JSON として不正なので、`Content-Type: application/json` で送ると通信层面上弾かれる。** `non_finite_vertex` を確認したい場合は、ヘッダを `text/plain` に変えて本文だけを送ること（`httpx2` では `content=` で送る）。JSON として妥当な値を送った場合は、この型は出ない。
 
 ### 4.2 エラーの構造
 
@@ -294,11 +303,11 @@
 | `type` | 機械可読な分類。クライアントはこれで分岐する |
 | `loc` | 発生箇所。本 API のエラーはすべて `["body"]`。フィールド検証エラーは `["body", "top_n"]` のようにフィールド名まで入る |
 | `msg` | 人間向けの説明（日本語）。表示に回す |
-| `spanning_trees` / `limit` | `type` が `too_many_spanning_trees` のときだけ付く実数 |
+| `spanning_trees` / `limit` | `type` が `too_many_spanning_trees` のときだけ付く**整数** |
 
 *   **クライアントは 422 の `detail` を一律に `for e in detail:` で処理できる。** `e["type"]` で分岐し、`e["msg"]` を表示に回す。
-*   **`type == "too_many_spanning_trees"` は入力が正当**であるということ。面を1枚減らすなど候補数が減れば成功する。それ以外の `type` は入力の修正が必要。
-*   **頂点の重複（`duplicate_vertex`）と面の非連結（`not_connected`）は別物**。前者は座標を1つにまとめる修正が必要で、面を削る윗では直らない。
+*   **`type == "too_many_spanning_trees"` と `search_budget_exceeded` は入力が正当**であるということ。面の数を減らせば成功する。それ以外の `type` は入力の修正が必要。
+*   **頂点の重複（`duplicate_vertex`）と面の非連結（`not_connected`）は別物**。前者は座標を1つにまとめる修正が必要で、面を削る方法では直らない。
 *   `detail` が文字列（本 API）と配列（Pydantic）に分かれていた頃は、本文を読まないと両者を区別できなかった。統一したのはこのため。
 
 ---

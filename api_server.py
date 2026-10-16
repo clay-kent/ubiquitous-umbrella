@@ -97,6 +97,19 @@ ERROR_RESPONSE = {
 }
 
 
+# 立方体1個ぶんの例（README のリクエスト例と同じもの）。
+# 從前の例は4頂点の四面体と2面の断片で、どちらの body も 422 になる。
+# OpenAPI の例はそのままコピペして動かせるべきなので、**通る例**を置く。
+_CUBE_VERTICES = [
+    [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+    [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+]
+_CUBE_FACES = [
+    [0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4],
+    [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7],
+]
+
+
 class SolidRequest(BaseModel):
     """任意の多面体の定義。
 
@@ -108,7 +121,8 @@ class SolidRequest(BaseModel):
     vertices: list[list[float]] = Field(
         ...,
         description="頂点座標の配列 [[x, y, z], ...]",
-        examples=[[[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]]],
+        examples=[_CUBE_VERTICES],
+        json_schema_extra={"minItems": 4},
     )
     faces: list[list[int]] = Field(
         ...,
@@ -116,7 +130,12 @@ class SolidRequest(BaseModel):
             "各面の頂点インデックス（3角形/4角形/N角形すべて可）。"
             "巻き順は任意で、外向きに正規化される。"
         ),
-        examples=[[[0, 1, 2], [0, 2, 3]]],
+        examples=[_CUBE_FACES],
+        # ⚠️ minItems は**スキーマ上の注記だけ**で、検証していない。
+        # 検証にすると「頂点数が足りません」が Pydantic の too_short になり、
+        # 本 API の too_few_vertices（日本語の msg 付き）と並んでしまう。
+        # 判定は validate_solid が一箇所で持つ。
+        json_schema_extra={"minItems": 4},
     )
     top_n: int = Field(
         1, ge=1, le=MAX_TOP_N, description="返す展開図の数。評価指標の良い順に n 個。"
