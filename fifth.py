@@ -291,13 +291,14 @@ def enumerate_spanning_trees(
         # 縮約後の頂点数は n-1 個。n-2 が pu と pv の統合先、残りの番号を詰める。
         merged = n - 2
 
-        def remap(x: int) -> int:
-            if x == pu or x == pv:
-                return merged
-            # pu・pv を除いた中の順位に詰め直す（pu と pv の大小は問わない）
-            return x - (pu < x) - (pv < x)
-
-        contracted = [(i, remap(a), remap(b)) for i, a, b in rest]
+        # remap をインライン化する（関数呼び出しを避ける）。
+        # ⚠️ 整数演算のみで**幾何の丸め演算には触れない**。列挙順序も
+        # 変わらないので、出力される辺列は bit 単位で一致する。
+        contracted = []
+        for i, a, b in rest:
+            a2 = merged if (a == pu or a == pv) else a - (pu < a) - (pv < a)
+            b2 = merged if (b == pu or b == pv) else b - (pu < b) - (pv < b)
+            contracted.append((i, a2, b2))
         yield from rec(contracted, n - 1, chosen + [orig])
 
     yield from rec(base, num_nodes, [])
