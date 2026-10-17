@@ -123,6 +123,24 @@ l_shape_b = l_shape
 cutout_b = cutout
 
 
+def frustum4():
+    """4角錐台（切頭角錐）。8頂点 / 6面 / 全域木 384本。"""
+    r0, r1, h, n = 1.0, 0.5, 1.0, 4
+    v = [
+        [r0 * math.cos(2 * math.pi * i / n), r0 * math.sin(2 * math.pi * i / n), 0.0]
+        for i in range(n)
+    ] + [
+        [r1 * math.cos(2 * math.pi * i / n), r1 * math.sin(2 * math.pi * i / n), h]
+        for i in range(n)
+    ]
+    f = [list(range(n - 1, -1, -1)), list(range(n, 2 * n))]
+    f += [[i, (i + 1) % n, n + (i + 1) % n, n + i] for i in range(n)]
+    return np.array(v, dtype=float), f
+
+
+frustum4_b = frustum4
+
+
 # --------------------------------------------------------------------------
 # validate_solid / orient_faces_outward
 # --------------------------------------------------------------------------
@@ -820,6 +838,59 @@ def test_errors_inside_the_tree_loop_propagate():
     finally:
         fifth._batch_canonical_keys = original
         fifth._LADDER_WINDOW = original_window
+
+
+def test_batched_partition_matches_per_tree_partition():
+    """バッチ版の「色細分による分割」が木ごと版と完全に一致する。
+
+    高速化の根拠はこれ。``_batch_canonical_keys`` は窓でまとめて計算するが、
+    得られる同型クラス分割は ``_net_signature``（木ごと版）と一致しなければ
+    一意数が壊れる。
+
+    これを「一意数が既知値に合う」で代用してはいけない（§3）。
+    個化が必要な行がプレーン経路の誤差を相殺しうるため、個数が
+    合ったことだけで正しさは証明できない。**分割そのものを比べる**。
+    """
+    for builder in (cube_b, frustum4_b):
+        v, f = builder()
+        faces = fifth.orient_faces_outward(v, f)
+        ctx = fifth.RibbonContext(v, faces)
+        edges = fifth.build_adjacency_graph(faces)
+        trees = list(fifth.enumerate_spanning_trees(edges, len(faces)))
+        n_nodes = ctx.n_nodes
+
+        positions = np.asarray(
+            [[ctx.adj_pos_of[e] for e in t] for t in trees], dtype=np.int64
+        )
+        partner, flip = fifth._glue_batch(ctx, positions)
+        colors, counts = fifth._batch_stabilize(ctx, partner, flip)
+
+        assert len(colors) == len(trees), "行数が変わっている（間引きの復元漏れ）"
+        assert (counts > 0).all(), "未初期化の行が残っている"
+
+        batch_classes = {}
+        ref_classes = {}
+        for i, tree in enumerate(trees):
+            if counts[i] == n_nodes:
+                batch_classes.setdefault(
+                    tuple(sorted(colors[i].tolist())), []
+                ).append(i)
+            ref_classes.setdefault(
+                fifth._net_signature(ctx, list(tree)), []
+            ).append(i)
+
+        # 木ごと版の各クラスは、batch 版ではちょうど1つのクラスの中に入る
+        for _key, idxs in ref_classes.items():
+            batches = {
+                tuple(sorted(colors[i].tolist()))
+                for i in idxs
+                if counts[i] == n_nodes
+            }
+            assert len(batches) <= 1, (builder, idxs, batches)
+        # 逆方向（batch 版が木ごと版の別クラスを混ぜない）も確認する
+        for _key, idxs in batch_classes.items():
+            refs = {fifth._net_signature(ctx, list(trees[i])) for i in idxs}
+            assert len(refs) == 1, (builder, idxs, refs)
 
 
 def test_window_size_does_not_change_the_result():

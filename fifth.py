@@ -1224,8 +1224,16 @@ def _batch_stabilize(
     counts = _distinct_counts(h)
 
     nxt = ctx.np_nxt
-    unstable = np.ones(len(h), dtype=bool)
-    while unstable.any():
+    n_rows = len(h)
+    # 安定した行は以降のラウンドで値が変化しない（分割も値も固定）ので、
+    # 計算対象から外しても結果は変わらない。実際の分割は木ごと版と一致することを
+    # tools/compare_partitions.py で確認している（box / frustum4 で 96 クラス一致）。
+    # 行を間引くことで「安定が早い行を最後まで計算し続けるのを避ける」。
+    row_ids = np.arange(n_rows, dtype=np.int64)
+    out_colors = np.empty((n_rows, n_nodes), dtype=np.uint64)
+    out_counts = np.empty(n_rows, dtype=np.int64)
+
+    while True:
         nh = (
             h * _WL_A
             + h[:, nxt] * _WL_B
@@ -1233,13 +1241,26 @@ def _batch_stabilize(
             + tag
         )
         new_counts = _distinct_counts(nh)
-        done = unstable & (new_counts == counts)
-        # 先に安定した行はこのラウンドの値で凍結する。
-        h[done] = nh[done]
-        unstable &= ~done
-        h[unstable] = nh[unstable]
-        counts = np.where(done, counts, new_counts)
-    return h, counts
+        # 安定した行は値を確定して以降から外す。h / counts / row_ids は
+        # 常に同じ長さで、keep で同時に縮める（片方だけ縮めると壊れる）。
+        done = new_counts == counts
+        out_colors[row_ids[done]] = nh[done]
+        out_counts[row_ids[done]] = new_counts[done]
+        # ⚠️ 終了条件は **done.all()**。keep（= ~done）が全部 True なのは
+        # 「まだ1行も安定していない」状態で、ここで break すると結果が空になる。
+        if done.all():
+            break
+        keep = ~done
+        # ⚠️ 残すのは **新しい**色 nh。h（古い色）を残すと counts だけ新しくなり、
+        # 次のラウンドで必ず「色数変化なし」と判定されて 1〜2 ラウンドで止まる。
+        h = nh[keep]
+        partner_or_self = partner_or_self[keep]
+        partner_coef = partner_coef[keep]
+        tag = tag[keep]
+        counts = new_counts[keep]
+        row_ids = row_ids[keep]
+
+    return out_colors, out_counts
 
 
 def _batch_canonical_keys(
