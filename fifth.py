@@ -1,8 +1,10 @@
 import math
 from collections.abc import Iterable, Iterator
+from itertools import islice
 from typing import Any, NamedTuple, cast
 
 import numpy as np
+import numpy.typing as npt
 import shapely
 from shapely.geometry import Polygon
 
@@ -892,15 +894,29 @@ def face_geometries(
 
 
 class RibbonContext:
-    """半辺構造の前計算結果。全域木ごとに変わらないので一度だけ作る。"""
+    """半辺構造の前計算結果。全域木ごとに変わらないので一度だけ作る。
+
+    Python リスト側のフィールド（nxt / edge_len / node_id / idx_map / shared）は
+    :func:`_glue_arrays` / :func:`_wl_refine` / :func:`_individualize_refine`
+    （木ごとの正規形計算）が使う。バッチ化された正規形計算
+    :func:`_batch_canonical_keys` は numpy フィールド（np_nxt / np_edge_len /
+    adj_* / adj_pos_of）を使う。どちらも同じ半辺グラフを指すので、
+    値の定義は1つに保つ（np_nxt = np.asarray(nxt) など）。
+    """
 
     __slots__ = (
+        "adj_fl",
+        "adj_nu",
+        "adj_nv",
+        "adj_pos_of",
         "edge_len",
         "faces",
         "idx_map",
         "n_faces",
         "n_nodes",
         "node_id",
+        "np_edge_len",
+        "np_nxt",
         "nxt",
         "shared",
         "vertices",
@@ -946,6 +962,34 @@ class RibbonContext:
         self.edge_len = edge_len
         self.idx_map = idx_map
         self.node_id = node_id
+
+        # --- バッチ化用の numpy 表現 ---------------------------------------
+        self.np_nxt = np.asarray(nxt, dtype=np.int64)
+        self.np_edge_len = np.asarray(edge_len, dtype=float)
+
+        # 接着表（隣接エッジ位置 -> 半辺番号と向き）。enumerate_spanning_trees
+        # が返す木の辺は (u, v) のタプルで、位置 p = build_adjacency_with_edges
+        # の列挙順に一致する（両者とも build_edge_map の列挙順を辿る）。
+        with_edges = build_adjacency_with_edges(faces)
+        adj_nu = np.empty(len(with_edges), dtype=np.int64)
+        adj_nv = np.empty(len(with_edges), dtype=np.int64)
+        adj_fl = np.empty(len(with_edges), dtype=np.int64)
+        adj_pos_of: dict[tuple[int, int], int] = {}
+        for p, (u, v, edge) in enumerate(with_edges):
+            adj_pos_of[(u, v)] = p
+            iu = idx_map[u][frozenset(edge)]
+            iv = idx_map[v][frozenset(edge)]
+            adj_nu[p] = node_id[u][iu]
+            adj_nv[p] = node_id[v][iv]
+            fu, fv = faces[u], faces[v]
+            ku, kv = len(fu), len(fv)
+            adj_fl[p] = 1 if (
+                fu[iu] == fv[(iv + 1) % kv] and fu[(iu + 1) % ku] == fv[iv]
+            ) else 0
+        self.adj_pos_of = adj_pos_of
+        self.adj_nu = adj_nu
+        self.adj_nv = adj_nv
+        self.adj_fl = adj_fl
 
         shared: dict[tuple[int, int], frozenset[int]] = {}
         for u, v, edge in build_adjacency_with_edges(faces):
@@ -1073,10 +1117,184 @@ def _net_signature(
 
     個別化-細分が全ての半辺を区別できた場合、その色は完全な同型判定になる。
     予算超過は :func:`_individualize_refine` が ``SolidError`` で報告する。
+
+    これは**木ごと**の正規形計算。``iter_unique_nets`` は窓単位で
+    バッチ化した :func:`_batch_canonical_keys` を使う。
     """
     partner, flip = _glue_arrays(ctx, tree_edges)
     color = [(ctx.edge_len[i], partner[i] >= 0, flip[i]) for i in range(ctx.n_nodes)]
     return _individualize_refine(ctx.nxt, partner, flip, color, [0])
+
+
+# ---------------------------------------------------------------------------
+# バッチ化された正規形計算
+#
+# ボトルネック実測 (prism7, 35,287 木): 全時間の約7割が _wl_refine の
+# 「木ごと・半辺ごと」の Python ループで、そこでの hash() 呼び出しは 2,600 万回。
+# 安定化WLは木ごとに独立な計算なので、窓（既定 2048 木）単位で同時に回せる。
+#
+# 正しさの契約:
+#   * 各行（木）は**初期状態から固定の動学分かち合い**を辿り、
+#     「色数が初めて増えなかったラウンド」で凍結する。収束ラウンド数は
+#     同型に対して不変なので、同型な木は同一の色列に到達する。
+#   * 1行の計算が他の行に影響しないため、窓の区切りや行の並びでは
+#     結果が変わらない。
+#   * 各ラウンドの色は「(自分, 折り先, 接着相手) の合成キー」をソートして
+#     退止に刻印する（ties は潰す: 等しいキー=等しい要素＝同一色）。
+#     成分は必ず [0, 2M) に収まるので int64 合成は衝突しない。
+# ---------------------------------------------------------------------------
+
+_LADDER_WINDOW = 2048
+
+# WL の色更新に使う係数（mod 2^64 で折り返す）。
+#
+# Python の ``hash()`` と同じく「多項式を 2^64 で畳み込む」ので、等しい入力は
+# 等しい色になり、異なる入力が異なる色になる確率は 2^-64 程度（同程度）。
+# 参考実装（_wl_refine の hash((color[i], color[nxt], ...))）と同じ性質のまま、
+# numpy の uint64 演算（配列は黙って折り返す）でベクトル計算できるようにしたもの。
+#
+#   新しい色 = A*自分の色 + B*折り先の色 + C*接着相手の色 + D*接着の有無 + E*接着の向き
+#
+# 接着が無い半辺は「接着相手の色」を 0 にし、「接着の有無」=0 で別の項にまとめる。
+# 0 も色として現れるので、接着ありの項とは係数が違う（横軸が別）ことを使う。
+_WL_A = np.uint64(0x9E3779B97F4A7C15)
+_WL_B = np.uint64(0xC2B2AE3D27D4EB4F)
+_WL_C = np.uint64(0x165667B19E3779F9)
+_WL_D = np.uint64(0x27D4EB2F165667C5)
+_WL_E = np.uint64(0x85EBCA77C2B2AE63)
+_WL_E0 = np.uint64(0xD6E8FEB86659FD93)
+_WL_D0 = np.uint64(0xA0761D6478BD642F)
+
+
+def _glue_batch(
+    ctx: RibbonContext, positions: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """(窓内の木数, F-1) の隣接位置から、(窓数, n_nodes) の partner / flip を作る。
+
+    partner は接着していない半辺で -1。_glue_arrays のバッチ版で、
+    値の定義は同一（:func:`_glue_arrays` の docstring 参照）。
+    """
+    rows = np.arange(len(positions))[:, None]
+    nu = ctx.adj_nu[positions]
+    nv = ctx.adj_nv[positions]
+    fl = ctx.adj_fl[positions]
+
+    partner = np.full((len(positions), ctx.n_nodes), -1, dtype=np.int64)
+    partner[rows, nu] = nv
+    partner[rows, nv] = nu
+
+    flip = np.zeros((len(positions), ctx.n_nodes), dtype=np.int64)
+    flip[rows, nu] = fl
+    flip[rows, nv] = fl
+    return partner, flip
+
+
+def _distinct_counts(h: np.ndarray) -> npt.NDArray[np.int64]:
+    """各行の異なる値の個数を数える（行ごとのソートが要るがベクトル1発）。"""
+    srt = np.sort(h, axis=1)
+    return np.asarray(1 + (srt[:, 1:] != srt[:, :-1]).sum(axis=1), dtype=np.int64)
+
+
+def _batch_stabilize(
+    ctx: RibbonContext,
+    partner: np.ndarray,
+    flip: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """各行を plain WL の安定化まで回す（個別化はしない）。
+
+    戻り値: (安定化後の色 (uint64), 各行の色数)。各行は「色数が初めて増えなかった
+    ラウンド」の値で凍結する。_wl_refine のバッチ版。
+
+    partner の -1（接着なし）は「接着相手の色」を 0 に落として区別する。
+    ラウンドの回数は行ごとに違うので、安定した行は以降の計算から外す。
+    """
+    n_nodes = ctx.n_nodes
+    glued = (partner >= 0).astype(np.uint64)
+    partner_or_self = np.where(partner >= 0, partner, np.arange(n_nodes)[None, :])
+    # 接着のある半辺だけ C を掛ける（ない半辺は 0 倍 = 0 になる）。
+    partner_coef = glued * _WL_C
+    # 接着の有無と向きは行で変わらないので先にまとめておく。
+    tag = glued * _WL_D + flip.astype(np.uint64) * _WL_E
+
+    # 初期色: (辺長, 接着の有無, 接着の向き)。辺長は ctx 内で順位に置き換える
+    # （長さが同じなら同じ色、长さが違えば違う色 = 参照実装のタプルと同じ性質）。
+    uniq = np.unique(ctx.np_edge_len)
+    eid = np.searchsorted(uniq, ctx.np_edge_len).astype(np.uint64)
+    h = eid[None, :] * _WL_E0 + tag
+    counts = _distinct_counts(h)
+
+    nxt = ctx.np_nxt
+    unstable = np.ones(len(h), dtype=bool)
+    while unstable.any():
+        nh = (
+            h * _WL_A
+            + h[:, nxt] * _WL_B
+            + np.take_along_axis(h, partner_or_self, axis=1) * partner_coef
+            + tag
+        )
+        new_counts = _distinct_counts(nh)
+        done = unstable & (new_counts == counts)
+        # 先に安定した行はこのラウンドの値で凍結する。
+        h[done] = nh[done]
+        unstable &= ~done
+        h[unstable] = nh[unstable]
+        counts = np.where(done, counts, new_counts)
+    return h, counts
+
+
+def _batch_canonical_keys(
+    ctx: RibbonContext,
+    mirror_ctx: RibbonContext,
+    trees: list[list[tuple[int, int]]],
+) -> list[tuple[tuple[Color, ...], tuple[Color, ...]]]:
+    """窓内の全木について (自身の正規形, 鏡像の正規形) を返す。
+
+    項目の並びは ``trees`` の順。各行は plain WL の安定化までバッチで回し、
+    その色がすべて別色ならそのまま正規形キーにする。まだ残ったセルがある場合は
+    既存の :func:`_individualize_refine`（個別化-細分）に回す。予算超過の判定と
+    ``SolidError`` の送出手続きはそちらと同一。
+
+    キーは ``(ソート済みの色)`` のタプル。木ごと版（_net_signature）と違い、
+    ハッシュ関数が違うので**キーの中身は一致しない**。一致するのは
+    「同型なら同じキーになる」「同じキーになる同型は伊勢同値」という性質で、
+    これは batch の行动力学が木ごと版と同じであることから従う。
+    """
+    n = len(trees)
+    keys: list[tuple[Color, ...]] = [None] * (2 * n)  # type: ignore[list-item]
+
+    for ctx_i, context in enumerate((ctx, mirror_ctx)):
+        # 位置の付け直しは**文脈ごと**に行う。build_edge_map は Dict の挿入順で
+        # 辺を列挙するので、面の巻き順を反転すると同じ辺でも位置番号が変わる。
+        # ctx の位置を鏡像文脈でそのまま使うと別の辺を指し、
+        # 鏡像が同一視されずに一意数が倍増する（実測: cube が 11 -> 30）。
+        positions = np.asarray(
+            [
+                [context.adj_pos_of[(e[0], e[1])] for e in tree]
+                for tree in trees
+            ],
+            dtype=np.int64,
+        )
+        partner, flip = _glue_batch(context, positions)
+        colors, counts = _batch_stabilize(context, partner, flip)
+        offset = ctx_i * n
+        nxt_list = context.nxt
+        n_nodes = context.n_nodes
+        rows_need_individualization = np.flatnonzero(counts != n_nodes)
+        for idx in rows_need_individualization.tolist():
+            # 色細分が止まったセルから個別化する。
+            keys[offset + idx] = _individualize_refine(
+                nxt_list,
+                partner[idx].tolist(),
+                flip[idx].tolist(),
+                colors[idx].tolist(),
+                [0],
+            )
+        for idx in range(n):
+            if counts[idx] == n_nodes:
+                # 全半辺が別色になった行 = 色列そのものが完全な同型判定になる。
+                # ソートして並べた色列がそのまま正規形キー。
+                keys[offset + idx] = tuple(sorted(colors[idx].tolist()))
+    return list(zip(keys[:n], keys[n:]))
 
 
 def iter_unique_nets(
@@ -1090,6 +1308,10 @@ def iter_unique_nets(
     重複は「正規形（同型なら必ず一致するキー）」で潰す。
     鏡像も同一視するので、自身と鏡像の正規形の小さい方をキーにする。
 
+    シグネ計算は窓単位でバッチ化する（:_batch_canonical_keys 参照）。
+    窓内では木の順序に従って重複判定・展開・重なり判定をするので、
+    返り値の順序は木ごとの列挙順と一致する。
+
     ⚠️ このループを ``except ValueError`` で包まないこと。
     そうするとループ中のあらゆる ValueError（予算超過を含む）が
     「この木は捨てる」と解釈され、**静かに誤った一意数**を返す。
@@ -1101,23 +1323,27 @@ def iter_unique_nets(
 
     exact_seen: set[tuple[Color, ...]] = set()
 
-    for tree in all_trees:
+    rest = iter(all_trees)
+    while True:
+        window = list(islice(rest, _LADDER_WINDOW))
+        if not window:
+            break
         # レイアウトより先に重複を判定する。
         # 全域木の多くは別の木に既に含まれる重複なので、ここで弾けるほど
         # 展開と重なり判定の回数が減る（実測で全体の約7割を占めていた）。
         # 同じ正規形の木は展開図が合同であり重なり判定の結果まで一致する
         # （test_unique_nets_geometry.py で独立に検証済み）ため、順序を入れ替えても
         # 返り値は変わらない。
-        sig = _net_signature(ctx, tree)
-        mirror_sig = _net_signature(mirror_ctx, tree)
+        key_pairs = _batch_canonical_keys(ctx, mirror_ctx, window)
 
-        # キーを先に登録してあるので、同型な木は展開せずに弾ける。
-        key = min(sig, mirror_sig)
-        if key in exact_seen:
-            continue
-        exact_seen.add(key)
+        for tree, (sig, mirror_sig) in zip(window, key_pairs):
+            # キーを先に登録してあるので、同型な木は展開せずに弾ける。
+            key = min(sig, mirror_sig)
+            if key in exact_seen:
+                continue
+            exact_seen.add(key)
 
-        polys = layout_tree(vertices, faces, normals, tree, layout_prep)
-        if not is_valid_layout(polys):
-            continue
-        yield tree, polys
+            polys = layout_tree(vertices, faces, normals, tree, layout_prep)
+            if not is_valid_layout(polys):
+                continue
+            yield tree, polys

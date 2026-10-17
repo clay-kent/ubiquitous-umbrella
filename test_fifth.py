@@ -5,6 +5,7 @@ import math
 import random
 import re
 from collections import Counter
+from itertools import islice
 
 import networkx as nx
 import numpy as np
@@ -789,7 +790,8 @@ def test_errors_inside_the_tree_loop_propagate():
     **静かに誤った一意数**を返していた。
 
     このテストは正常系ではなく guard である:
-    ``_net_signature`` に注入して、-raising ことを確かめる。
+    正規形の計算経路（窓単位バッチの ``_batch_canonical_keys``）に注入して、
+    例外がそのまま呼び出し元へ届くことを確かめる。
     """
     v, f = cube()
     faces = fifth.orient_faces_outward(v, f)
@@ -797,22 +799,97 @@ def test_errors_inside_the_tree_loop_propagate():
     trees = list(fifth.enumerate_spanning_trees(fifth.build_adjacency_graph(f), len(f)))
 
     boom = ValueError("-loop-boom-")
-    original = fifth._net_signature
+    original = fifth._batch_canonical_keys
+    original_window = fifth._LADDER_WINDOW
 
     calls = {"n": 0}
 
-    def exploding(ctx, tree):
+    def exploding(ctx, mirror_ctx, window):
         calls["n"] += 1
-        if calls["n"] >= 3:
+        if calls["n"] >= 2:
             raise boom
-        return original(ctx, tree)
+        return original(ctx, mirror_ctx, window)
 
-    fifth._net_signature = exploding
+    # 窓を小さくして「2窓目」で例外が起きるようにする
+    # （立方体の 384 木は既定窓 2048 に収まるので、そのままでは1回しか呼ばれない）
+    fifth._LADDER_WINDOW = 16
+    fifth._batch_canonical_keys = exploding
     try:
         with pytest.raises(ValueError, match="loop-boom"):
             list(fifth.iter_unique_nets(v, faces, iter(trees), normals))
     finally:
-        fifth._net_signature = original
+        fifth._batch_canonical_keys = original
+        fifth._LADDER_WINDOW = original_window
+
+
+def test_window_size_does_not_change_the_result():
+    """窓の大きさが違っても返す展開図列は完全に同じ。
+
+    バッチ化する結合則の主張（行間の干渉が無いこと）を、
+    「窓 1（全木を1行ずつ）」と「窓 4096（全部まとめて）」の比較で固定する。
+    """
+    v, f = prism5_b()
+    faces = fifth.orient_faces_outward(v, f)
+    normals = fifth.compute_normals(v, faces)
+    trees = list(fifth.enumerate_spanning_trees(fifth.build_adjacency_graph(f), len(f)))
+
+    def run(window: int):
+        original = fifth._LADDER_WINDOW
+        fifth._LADDER_WINDOW = window
+        try:
+            return [tree for tree, _ in fifth.iter_unique_nets(v, faces, iter(trees), normals)]
+        finally:
+            fifth._LADDER_WINDOW = original
+
+    assert run(1) == run(4096)
+
+
+def test_batched_and_per_tree_signatures_agree_on_uniqueness():
+    """窓単位バッチの正規形と木ごと版は「一意数」が一致する。
+
+    ハッシュ関数が違うのでキーの中身は一致しない。一致が保証されるのは
+    「同型なら同じキー」「同じキーなら同型」という同型判定の性質だけで、
+    これは batch 版の行動力学が木ごと版と同一であることに由来する。
+    このテストはその性質をプリセット全体で固定する。
+    """
+    cases = [
+        (tetrahedron_b, 2),
+        (cube_b, 11),
+        (prism3_b, 9),
+        (prism4_b, 29),
+        (prism5_b, 99),
+        (pyramid4_b, 8),
+        (pyramid5_b, 15),
+    ]
+    for builder, expected in cases:
+        v, f = builder()
+        faces = fifth.orient_faces_outward(v, f)
+        normals = fifth.compute_normals(v, faces)
+        edges = fifth.build_adjacency_graph(faces)
+
+        ctx = fifth.RibbonContext(v, faces)
+        mirror_ctx = fifth.RibbonContext(v, [list(reversed(x)) for x in faces])
+
+        batch_keys = set()
+        rest = fifth.enumerate_spanning_trees(edges, len(faces))
+        while True:
+            window = list(islice(rest, 64))  # 窓的大小を変えても結果は同じ
+            if not window:
+                break
+            for sig, mirror_sig in fifth._batch_canonical_keys(
+                ctx, mirror_ctx, window
+            ):
+                batch_keys.add(min(sig, mirror_sig))
+
+        per_tree = {
+            min(
+                fifth._net_signature(ctx, list(t)),
+                fifth._net_signature(mirror_ctx, list(t)),
+            )
+            for t in fifth.enumerate_spanning_trees(edges, len(faces))
+        }
+        assert len(batch_keys) == expected, builder
+        assert len(batch_keys) == len(per_tree), builder
 
 
 def test_search_budget_exceeded_raises_a_named_solid_error():
