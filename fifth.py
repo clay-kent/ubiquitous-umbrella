@@ -566,17 +566,19 @@ def layout_tree(
         coords_y = pts @ axis_y + float(shift @ u_y)
         coords.append(np.column_stack([coords_x, coords_y]))
 
-    if precomputed["uniform_ring"]:
-        # 頂点数が揃っていればまとめて作ると Polygon() を1つずつ呼ぶより速い。
-        # 面数は validate_solid で 4 以上なので、shapely.polygons は常に
-        # GeometryArray を返す（Polygon 単体分岐は取り除いた）。
-        # その保証は実行時のものなので、型消去は cast で明示する。
-        built = cast(
-            list[Polygon],
-            shapely.polygons(shapely.linearrings(np.stack(coords))),
-        )
-        return list(built)
-    return [Polygon(c) for c in coords]
+    # 面を shapely の Polygon に変換する。
+    #
+    # 頂点数が揃っていなくても ``indices`` でまとめて作れる（shapely 2.x）。
+    # Polygon() を1枚ずつ呼ぶと、頂点数が混在する立体（角錐台の底面など、
+    # 8角形と四角形が混ざる）では Python 呼び出しが面数だけかかる。
+    flat = np.concatenate(coords, axis=0)
+    counts = [len(c) for c in coords]
+    indices = np.repeat(np.arange(n_faces), counts)
+    built = cast(
+        list[Polygon],
+        shapely.polygons(shapely.linearrings(flat, indices=indices)),
+    )
+    return list(built)
 
 
 def is_valid_layout(polygons: list[Polygon]) -> bool:

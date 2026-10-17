@@ -840,6 +840,38 @@ def test_errors_inside_the_tree_loop_propagate():
         fifth._LADDER_WINDOW = original_window
 
 
+@pytest.mark.parametrize(
+    "builder",
+    [cube_b, tetrahedron_b, prism5_b, pyramid5_b, l_shape_b, frustum4_b],
+    ids=["cube", "tetra", "prism5", "pyr5", "L-shape", "frustum4"],
+)
+def test_layout_polygons_equal_one_by_one_construction(builder):
+    """一括生成した Polygon が Polygon() 逐次生成と幾何的に一致する。
+
+    ``layout_tree`` は頂点数が揃っていなくても ``indices`` で一括生成する
+    （角錐台のように 8角形と四角形が混ざるため）。逐次生成との一致は
+    「面積・外周長・頂点数・座標」で見る。面積だけだと縮退を見落とすため、
+    座標列そのものも比べる。
+    """
+    v, f = builder()
+    normals = fifth.compute_normals(v, f)
+    prep = fifth.prepare_layout(v, f, normals)
+    edges = fifth.build_adjacency_graph(f)
+    tree = next(iter(fifth.enumerate_spanning_trees(edges, len(f))))
+    polys = fifth.layout_tree(v, f, normals, tree, prep)
+
+    assert len(polys) == len(f)
+    for i, poly in enumerate(polys):
+        one = Polygon(np.asarray(poly.exterior.coords)[:-1])
+        assert poly.equals(one), (builder, i)
+        assert poly.area == pytest.approx(one.area, abs=1e-12), (builder, i)
+        assert len(poly.exterior.coords) - 1 == len(f[i]), (builder, i)
+        assert np.allclose(
+            np.asarray(poly.exterior.coords)[:-1],
+            np.asarray(one.exterior.coords)[:-1],
+        ), (builder, i)
+
+
 def test_batched_partition_matches_per_tree_partition():
     """バッチ版の「色細分による分割」が木ごと版と完全に一致する。
 
