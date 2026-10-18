@@ -617,9 +617,12 @@ def layout_tree(
         if not placed[i]:
             raise ValueError(f"面{i} へ到達できませんでした（全域木が不正です）。")
         face_rot, t = rot[i], off[i]
-        # p_trans = r @ p + t を、2D 投影に代入してまとめて計算する
-        axis_x = face_rot.T @ u_x
-        axis_y = face_rot.T @ u_y
+        # p_trans = r @ p + t を、2D 投影に代入してまとめて計算する。
+        # ``u @ face_rot`` は ``face_rot.T @ u`` と**ビット単位で同じ**
+        # （3要素の内積と同じ理由。tools/check_small_dot_bits.py の系統で確認）で、
+        # 転置ビューを作らないぶん速い。
+        axis_x = u_x @ face_rot
+        axis_y = u_y @ face_rot
         t0, t1, t2 = t.tolist()
         s0 = t0 - ox
         s1 = t1 - oy
