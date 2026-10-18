@@ -602,6 +602,33 @@ def test_is_valid_layout_rejects_partial_overlap():
     assert not fifth.is_valid_layout([a, b])
 
 
+@pytest.mark.parametrize(
+    "builder",
+    [cube_b, tetrahedron_b, prism4_b, prism5_b],
+    ids=["cube", "tetra", "prism4", "prism5"],
+)
+def test_folded_pairs_skip_does_not_change_validity(builder):
+    """折り線ペアの省略が、実際の展開図で結果を変えないことを固定する。
+
+    前提: 展開図で折り線を共有する面対（= 木の辺）は、折り曲げの構成上
+    折り線の反対側に並ぶので交差面積が厳密に 0。この前提が崩れる（別の
+    理由で重なる）と、2 つの呼び出しで結果が割れてここで落ちる。
+    """
+    v, f = builder()
+    normals = fifth.compute_normals(v, f)
+    prep = fifth.prepare_layout(v, f, normals)
+    edges = fifth.build_adjacency_graph(f)
+    n_trees = 0
+    for tree in fifth.enumerate_spanning_trees(edges, len(f)):
+        polys = fifth.layout_tree(v, f, normals, tree, prep)
+        folded = {tuple(sorted(e)) for e in tree}
+        assert fifth.is_valid_layout(polys, folded) == fifth.is_valid_layout(
+            polys
+        ), tree
+        n_trees += 1
+    assert n_trees > 0
+
+
 def _old_bbox_perimeter(polys):
     """削除した CLI 側の周長定義 ``2*(w+h)``（外接矩形の周長）。
 
