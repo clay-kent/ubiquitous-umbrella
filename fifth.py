@@ -574,11 +574,14 @@ def layout_tree(
     _parents, pairs = _tree_bfs(n_faces, tree_edges)
 
     # 親が子より先に現れる幅優先順で、回転と平行移動を伝播させる。
-    # placed は到達した面だけ True にする（rot の型を Optional にしないため）。
-    eye = np.eye(3)
-    zero = np.zeros(3)
-    rot = [eye] * n_faces
-    off = [zero] * n_faces
+    # placed は到達した面だけ True にする。
+    #
+    # rot / off を最初から numpy 配列に貯める（list -> array 変換を無くすため）。
+    # 値そのものは list 版と同一で、丸め演算も変わらない。
+    rot = np.empty((n_faces, 3, 3))
+    off = np.empty((n_faces, 3))
+    rot[0] = np.eye(3)
+    off[0] = 0.0
     placed = [False] * n_faces
     placed[0] = True
 
@@ -602,34 +605,24 @@ def layout_tree(
     # 面ごとに column_stack すると呼び出しが面数ぶん（実測 lshape で 32,544 回）。
     # x / y を別々に貯めて最後に1回だけ結合すれば、値も行順も完全に同一。
     #
-    # 平行移動ぶんの定数項 ``shift @ u`` は**3要素の内積**だけで、
-    # numpy の内積はこのサイズではスカラ式とビット一致する
-    # （``tools/check_small_dot_bits.py``: 30万回で不一致 0）。スカラ化すると
-    # numpy ディスパッチ（減算1 + 内積2 + float()2）を丸ごと削れる。
-    # ``origin``/``u`` はループ不変なので先に Python float に落とす。
-    ox, oy, oz = origin.tolist()
-    ux0, ux1, ux2 = u_x.tolist()
-    uy0, uy1, uy2 = u_y.tolist()
+    # 軸 ``u @ rot[i]`` は einsum で一括計算しても**ビット単位で同じ**
+    # （``tools/check_projection_axes_bits.py``: 2万回で不一致 0）。
+    # 平行移動の定数項 ``(off - origin) @ u`` も成分和にすれば同じ。
+    # これで面ごとの numpy ディスパッチを軸2回＋定数2回ぶんに圧縮できる。
+    axes_x = np.einsum("b,fba->fa", u_x, rot)
+    axes_y = np.einsum("b,fba->fa", u_y, rot)
+    shift = off - origin
+    cs_x = (shift * u_x).sum(axis=1)
+    cs_y = (shift * u_y).sum(axis=1)
 
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
     for i in range(n_faces):
         if not placed[i]:
             raise ValueError(f"面{i} へ到達できませんでした（全域木が不正です）。")
-        face_rot, t = rot[i], off[i]
-        # p_trans = r @ p + t を、2D 投影に代入してまとめて計算する。
-        # ``u @ face_rot`` は ``face_rot.T @ u`` と**ビット単位で同じ**
-        # （3要素の内積と同じ理由。tools/check_small_dot_bits.py の系統で確認）で、
-        # 転置ビューを作らないぶん速い。
-        axis_x = u_x @ face_rot
-        axis_y = u_y @ face_rot
-        t0, t1, t2 = t.tolist()
-        s0 = t0 - ox
-        s1 = t1 - oy
-        s2 = t2 - oz
         pts = face_pts[i]
-        xs.append(pts @ axis_x + (s0 * ux0 + s1 * ux1 + s2 * ux2))
-        ys.append(pts @ axis_y + (s0 * uy0 + s1 * uy1 + s2 * uy2))
+        xs.append(pts @ axes_x[i] + cs_x[i])
+        ys.append(pts @ axes_y[i] + cs_y[i])
 
     flat = np.column_stack([np.concatenate(xs), np.concatenate(ys)])
 
