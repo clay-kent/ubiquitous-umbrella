@@ -417,6 +417,62 @@ def build_shared_of(faces: list[list[int]]) -> dict[tuple[int, int], tuple[int, 
     return shared_of
 
 
+def _build_fold_tables(
+    vertices: np.ndarray, faces: list[list[int]], normals: list[np.ndarray]
+) -> dict[tuple[int, int], tuple[np.ndarray, np.ndarray]]:
+    """隣接面対ごとに折り曲げの回転行列と並進ベクトルを前計算する。
+
+    ``layout_tree`` の BFS はこの表を引くだけになる。``r`` の値は木に依存しない
+    ので、列挙する全域木が何本でも計算は1回で済む。
+
+    ``r`` は共有辺の軸 ``k`` まわりで面 v を面 u と同じ平面まで倒す回転
+    （Rodrigues）。``k`` は共有辺の端点順で決まるが、``build_adjacency_with_edges``
+    が返す辺は常に ``(小, 大)`` に正規化されているので、``(u, v)`` と ``(v, u)``
+    で ``k`` の向きは共通。法線を入れ替えると
+    ``s = dot(cross(k, n_v), n_u)`` の符号だけが反転し、回転角の符号が反転する。
+    つまり ``r(v, u) == r(u, v).T``（逆回転）である。
+
+    ``w = p_a - r @ p_a`` は「回転の中心を共有辺へ移す」並進で、
+    ``p_a``（辺の端点の一方）**または** ``p_b`` のどちらを使っても数学的には
+    同じ結果になる（``p_a - p_b`` は回転軸 ``k`` に平行で、``(I - r)(p_a - p_b) = 0``
+    だから）。ただし浮動小数では一致しないので、
+    ``(u, v)``・``(v, u)`` の**両方で ``p_a``（= edge[0]）を使う**。
+    こうすると前計算前の実装と**ビット単位で同じ** ``off`` を再現でき、
+    同値の指標を持つ展開図の並び順まで含めて応答が完全に一致する
+    （prism4 の golden がこの性質に依存していた。``p_b`` を使うと 1 ULP
+    ずれて安定ソートの tie が反転し、golden が落ちる）。
+    """
+    fold_of: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+    for u, v, edge in build_adjacency_with_edges(faces):
+        p_a = vertices[edge[0]]
+        p_b = vertices[edge[1]]
+        k = (p_b - p_a) / np.linalg.norm(p_b - p_a)
+        kx, ky, kz = k.tolist()
+        nx_, ny_, nz_ = normals[u].tolist()
+        mx, my, mz = normals[v].tolist()
+
+        c = mx * nx_ + my * ny_ + mz * nz_
+        # s = dot(cross(k, n_v), n_u) （np.cross は微小配列では極端に遅い）
+        s = (
+            (ky * mz - kz * my) * nx_
+            + (kz * mx - kx * mz) * ny_
+            + (kx * my - ky * mx) * nz_
+        )
+        v1c = 1.0 - c
+        r = np.array(
+            [
+                [kx * kx * v1c + c, kx * ky * v1c - kz * s, kx * kz * v1c + ky * s],
+                [ky * kx * v1c + kz * s, ky * ky * v1c + c, ky * kz * v1c - kx * s],
+                [kz * kx * v1c - ky * s, kz * ky * v1c + kx * s, kz * kz * v1c + c],
+            ]
+        )
+        fold_of[(u, v)] = (r, p_a - r @ p_a)
+        # (v, u) は逆回転 r.T。並進も p_a 基準（上のコメント参照）。
+        rt = r.T
+        fold_of[(v, u)] = (rt, p_a - rt @ p_a)
+    return fold_of
+
+
 def prepare_layout(
     vertices: np.ndarray, faces: list[list[int]], normals: list[np.ndarray]
 ) -> Layout:
@@ -439,7 +495,9 @@ def prepare_layout(
         # 面の3D座標も変わらないので、毎回の多少次索引を避ける
         "face_pts": [vertices[f] for f in faces],
         # 全面の頂点数が同じなら、まとめて Polygon を作れる
-        "uniform_ring": len({len(f) for f in faces}) == 1,
+        # (面u, 面v) -> (折り曲げ回転行列 r, w = p_a - r @ p_a)。
+        # r は共有辺と両面の法線だけで決まるので木に依存しない。
+        "fold_of": _build_fold_tables(vertices, faces, normals),
     }
 
 
@@ -499,10 +557,14 @@ def layout_tree(
     平行移動・回転は 4x4 行列ではなく (回転行列 R, 移動ベクトル t) で持ち、
     最終的な 2D への投影もまとめてベクトル演算する。
     全域木の数だけ呼び出されるため、ここは定数倍でも効く。
+
+    折り曲げの回転行列 ``r`` は**木に依存しない**（共有辺と両面の法線だけで決まる）ので、
+    :func:`_build_fold_tables` で隣接面対ごとに1回だけ計算し、ここでは引くだけにする。
+    ループに残るのは行列積2回だけになる。
     """
     if precomputed is None:
         precomputed = prepare_layout(vertices, faces, normals)
-    shared_of = precomputed["shared_of"]
+    fold_of = precomputed["fold_of"]
     n_faces = len(faces)
 
     _parents, pairs = _tree_bfs(n_faces, tree_edges)
@@ -519,33 +581,13 @@ def layout_tree(
     for u, v in pairs:
         # tree_edges は build_adjacency_graph 由来の全域木なので共有辺は必ず存在する。
         # そうでない呼び出し（利用者が前条件を破った場合）はここで KeyError になる。
-        edge = shared_of[(u, v)]
-
-        p_a = vertices[edge[0]]
-        p_b = vertices[edge[1]]
-        k = (p_b - p_a) / np.linalg.norm(p_b - p_a)
-        kx, ky, kz = k.tolist()
-        nx_, ny_, nz_ = normals[u].tolist()
-        mx, my, mz = normals[v].tolist()
-
-        c = mx * nx_ + my * ny_ + mz * nz_
-        # s = dot(cross(k, n_v), n_u) （np.cross は微小配列では極端に遅い）
-        s = (
-            (ky * mz - kz * my) * nx_
-            + (kz * mx - kx * mz) * ny_
-            + (kx * my - ky * mx) * nz_
-        )
-        v1c = 1.0 - c
-        r = np.array(
-            [
-                [kx * kx * v1c + c, kx * ky * v1c - kz * s, kx * kz * v1c + ky * s],
-                [ky * kx * v1c + kz * s, ky * ky * v1c + c, ky * kz * v1c - kx * s],
-                [kz * kx * v1c - ky * s, kz * ky * v1c + kx * s, kz * kz * v1c + c],
-            ]
-        )
+        #
+        # r（折り曲げ回転）と w = p_a - r @ p_a は前計算済み。
+        # ループに残るのは行列積2回だけ。
+        r, w = fold_of[(u, v)]
 
         rot[v] = rot[u] @ r
-        off[v] = rot[u] @ (p_a - r @ p_a) + off[u]
+        off[v] = rot[u] @ w + off[u]
         placed[v] = True
 
     origin = precomputed["origin"]
