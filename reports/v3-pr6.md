@@ -44,7 +44,7 @@ if len(np.unique(vertices, axis=0)) != n_v:
 
 - **bowtie**: どちらの段階で見ても 422。`type` が `not_connected` → `duplicate_vertex` に変わっただけ。
 - **重複座標**: `non_planar_face` → `duplicate_vertex`。前者は**原因を示していない**
-  （平面性问题に見えるが、実際の修正は頂点の統合）。
+  （平面性の問題に見えるが、実際の修正は頂点の統合）。
 
 つまりこれは **エラー分類の改善**であって、「隔離ホールの閉鎖」ではない。
 新たに弾かれる入力は無い。

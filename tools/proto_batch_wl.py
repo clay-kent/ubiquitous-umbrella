@@ -73,7 +73,7 @@ def wl_batch(colors, nxt_idx, partner_idx, flip, n, batch):
         sorted_new = np.sort(new, axis=1)
         cnt1 = 1 + (sorted_new[:, 1:] != sorted_new[:, :-1]).sum(axis=1)
         if len(set(cnt0.tolist())) == len(set(cnt1.tolist())):
-            # 实验: 収束した行だけ抜けても、ウインドウ全体の収束まで回す
+            # 実験: 収束した行だけ抜けても、ウインドウ全体の収束まで回す
             return new, cnt1
 
 

@@ -32,7 +32,7 @@ ctx = fifth.RibbonContext(v, faces)
 trees = list(fifth.enumerate_spanning_trees(fifth.build_adjacency_graph(faces), len(faces)))
 pos = [[ctx.adj_pos_of[(u, w)] for u, w in t] for t in trees]
 
-# 找到一个 batch 分区与 ref 不一致的树
+# batch の分割と ref が一致しない木を1つ見つける
 for t_i, tree in enumerate(trees):
     bp, bf = fifth._glue_batch(ctx, np.asarray([pos[t_i]], dtype=np.int64))
     c, cnt = fifth._batch_stabilize(ctx, bp, bf)
