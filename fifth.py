@@ -961,6 +961,7 @@ class RibbonContext:
         "adj_fl",
         "adj_nu",
         "adj_nv",
+        "adj_pos_matrix",
         "adj_pos_of",
         "edge_len",
         "faces",
@@ -1043,6 +1044,13 @@ class RibbonContext:
         self.adj_nu = adj_nu
         self.adj_nv = adj_nv
         self.adj_fl = adj_fl
+        # (面u, 面v) -> 位置 p の行列版。adj_pos_of の dict 引きを
+        # 列挙木のバッチで numpy のファンシー索引に置き換えるために持つ。
+        # 隣接しない面対は -1（参照されない）。
+        adj_pos_matrix = np.full((self.n_faces, self.n_faces), -1, dtype=np.int64)
+        for (u, v), p in adj_pos_of.items():
+            adj_pos_matrix[u, v] = p
+        self.adj_pos_matrix = adj_pos_matrix
 
         shared: dict[tuple[int, int], frozenset[int]] = {}
         for u, v, edge in build_adjacency_with_edges(faces):
@@ -1336,18 +1344,17 @@ def _batch_canonical_keys(
     n = len(trees)
     keys: list[tuple[Color, ...]] = [None] * (2 * n)  # type: ignore[list-item]
 
+    # すべての木は F-1 本の辺を持つ（全域木の定義）。辺の (u, v) を
+    # (n, F-1, 2) の配列に一括変換すれば、位置 p は adj_pos_matrix の
+    # ファンシー索引1回で求まる（以前は木×辺の Python 内包 + dict 引き）。
+    edges_arr = np.asarray(trees, dtype=np.int64)
+
     for ctx_i, context in enumerate((ctx, mirror_ctx)):
         # 位置の付け直しは**文脈ごと**に行う。build_edge_map は Dict の挿入順で
         # 辺を列挙するので、面の巻き順を反転すると同じ辺でも位置番号が変わる。
         # ctx の位置を鏡像文脈でそのまま使うと別の辺を指し、
         # 鏡像が同一視されずに一意数が倍増する（実測: cube が 11 -> 30）。
-        positions = np.asarray(
-            [
-                [context.adj_pos_of[(e[0], e[1])] for e in tree]
-                for tree in trees
-            ],
-            dtype=np.int64,
-        )
+        positions = context.adj_pos_matrix[edges_arr[:, :, 0], edges_arr[:, :, 1]]
         partner, flip = _glue_batch(context, positions)
         colors, counts = _batch_stabilize(context, partner, flip)
         offset = ctx_i * n
@@ -1363,11 +1370,14 @@ def _batch_canonical_keys(
                 colors[idx].tolist(),
                 [0],
             )
-        for idx in range(n):
-            if counts[idx] == n_nodes:
-                # 全半辺が別色になった行 = 色列そのものが完全な同型判定になる。
-                # ソートして並べた色列がそのまま正規形キー。
-                keys[offset + idx] = tuple(sorted(colors[idx].tolist()))
+        # 全半辺が別色になった行 = 色列そのものが完全な同型判定になる。
+        # ソートして並べた色列がそのまま正規形キー。行ごとの sorted() を
+        # 呼ばず、軸1の numpy ソートで一括してから tuple 化する。
+        rows_distinct = np.flatnonzero(counts == n_nodes)
+        if rows_distinct.size:
+            sorted_colors = np.sort(colors, axis=1).tolist()
+            for idx in rows_distinct.tolist():
+                keys[offset + idx] = tuple(sorted_colors[idx])
     return list(zip(keys[:n], keys[n:]))
 
 
