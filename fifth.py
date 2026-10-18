@@ -493,6 +493,11 @@ def prepare_layout(
         "u_y": u_y,
         # 面の3D座標も変わらないので、毎回の多少次索引を避ける
         "face_pts": [vertices[f] for f in faces],
+        # LinearRing を一括生成するときの「どの座標がどの面か」の対応。
+        # 面の頂点数だけから決まり木に依存しないので、ここで1回だけ作る。
+        "flat_indices": np.repeat(
+            np.arange(len(faces)), [len(f) for f in faces]
+        ),
         # 全面の頂点数が同じなら、まとめて Polygon を作れる
         # (面u, 面v) -> (折り曲げ回転行列 r, w = p_a - r @ p_a)。
         # r は共有辺と両面の法線だけで決まるので木に依存しない。
@@ -630,8 +635,8 @@ def layout_tree(
     # 頂点数が揃っていなくても ``indices`` でまとめて作れる（shapely 2.x）。
     # Polygon() を1枚ずつ呼ぶと、頂点数が混在する立体（角錐台の底面など、
     # 8角形と四角形が混ざる）では Python 呼び出しが面数だけかかる。
-    counts = [len(pts) for pts in face_pts]
-    indices = np.repeat(np.arange(n_faces), counts)
+    # ``indices`` は面の頂点数だけで決まるため prepare_layout で前計算済み。
+    indices = precomputed["flat_indices"]
     built = cast(
         list[Polygon],
         shapely.polygons(shapely.linearrings(flat, indices=indices)),
@@ -667,13 +672,17 @@ def is_valid_layout(
     n_polys = len(polygons)
     if n_polys < 2:
         return True
-    arr = shapely.bounds(np.asarray(polygons, dtype=object))
+    folds = folded_pairs if folded_pairs is not None else frozenset()
+    # 外接矩形は Python float に落としてから使う。numpy のスカラは演算ごとに
+    # ディスパッチ費用が乗るため、ペア数（面数の2乗）だけ回るこのループでは
+    # float のほうがはっきり速い。値はビット単位で同じ（float64 のまま）。
+    bnds = shapely.bounds(np.asarray(polygons, dtype=object)).tolist()
     for i in range(n_polys):
-        ax0, ay0, ax1, ay1 = arr[i, 0], arr[i, 1], arr[i, 2], arr[i, 3]
+        ax0, ay0, ax1, ay1 = bnds[i]
         for j in range(i + 1, n_polys):
-            if folded_pairs is not None and (i, j) in folded_pairs:
+            if (i, j) in folds:
                 continue
-            bx0, by0, bx1, by1 = arr[j, 0], arr[j, 1], arr[j, 2], arr[j, 3]
+            bx0, by0, bx1, by1 = bnds[j]
             # 外接矩形が重ならなければ交差面積も 0 なので交差計算を省略できる
             if ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0:
                 continue
