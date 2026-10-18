@@ -597,6 +597,16 @@ def layout_tree(
 
     # 面ごとに column_stack すると呼び出しが面数ぶん（実測 lshape で 32,544 回）。
     # x / y を別々に貯めて最後に1回だけ結合すれば、値も行順も完全に同一。
+    #
+    # 平行移動ぶんの定数項 ``shift @ u`` は**3要素の内積**だけで、
+    # numpy の内積はこのサイズではスカラ式とビット一致する
+    # （``tools/check_small_dot_bits.py``: 30万回で不一致 0）。スカラ化すると
+    # numpy ディスパッチ（減算1 + 内積2 + float()2）を丸ごと削れる。
+    # ``origin``/``u`` はループ不変なので先に Python float に落とす。
+    ox, oy, oz = origin.tolist()
+    ux0, ux1, ux2 = u_x.tolist()
+    uy0, uy1, uy2 = u_y.tolist()
+
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
     for i in range(n_faces):
@@ -606,10 +616,13 @@ def layout_tree(
         # p_trans = r @ p + t を、2D 投影に代入してまとめて計算する
         axis_x = face_rot.T @ u_x
         axis_y = face_rot.T @ u_y
-        shift = t - origin
+        t0, t1, t2 = t.tolist()
+        s0 = t0 - ox
+        s1 = t1 - oy
+        s2 = t2 - oz
         pts = face_pts[i]
-        xs.append(pts @ axis_x + float(shift @ u_x))
-        ys.append(pts @ axis_y + float(shift @ u_y))
+        xs.append(pts @ axis_x + (s0 * ux0 + s1 * ux1 + s2 * ux2))
+        ys.append(pts @ axis_y + (s0 * uy0 + s1 * uy1 + s2 * uy2))
 
     flat = np.column_stack([np.concatenate(xs), np.concatenate(ys)])
 
