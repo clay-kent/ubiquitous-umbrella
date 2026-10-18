@@ -1350,12 +1350,19 @@ def _batch_stabilize(
     out_counts = np.empty(n_rows, dtype=np.int64)
 
     while True:
-        nh = (
-            h * _WL_A
-            + h[:, nxt] * _WL_B
-            + np.take_along_axis(h, partner_or_self, axis=1) * partner_coef
-            + tag
-        )
+        # ⚠️ 1 本の式で書くと (rows, n_nodes) の一時配列が 9 個でき、このサイズ
+        # （実測 stairs で 2048 x 48 uint64 = 786 KB）ではそれが支配的になる。
+        # 逐次 in-place にすると確保は 3 個で済む。値を足す順序は元の式と同一なので
+        # **ビット単位で同じ**（uint64 の掛け算・足し算は順序で値が変わり得るため、
+        # 順序を崩さないことだけが条件）。CPU 時間で約 1.7 倍速い。
+        nh = h * _WL_A
+        t = h[:, nxt]
+        t *= _WL_B
+        nh += t
+        t2 = np.take_along_axis(h, partner_or_self, axis=1)
+        t2 *= partner_coef
+        nh += t2
+        nh += tag
         new_counts = _distinct_counts(nh)
         # 安定した行は値を確定して以降から外す。h / counts / row_ids は
         # 常に同じ長さで、keep で同時に縮める（片方だけ縮めると壊れる）。
