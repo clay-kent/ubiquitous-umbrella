@@ -234,8 +234,15 @@ L 字柱（1516 種）と 6 角柱（354 種）は全域木が 8,100 本あり�
 | `tools/probe_tree_adjacent.py` | bbox を通過するペアのうち折り線ペアの割合 |
 | `tools/probe_wl_rounds.py` | 色細分のラウンドごとの費用と残存行数（打ち切り案の可否判断） |
 | `tools/hash_layout_bits.py` | **全立体の展開図座標をビット単位でハッシュ**（丸めを変えていないことの証明） |
+| `tools/hash_metrics_rounded.py` | 全展開図の指標を**9桁丸めでハッシュ**（丸めが ULP 級に変わるときの観測差チェック） |
+| `tools/bench_signatures_cpu.py` | 署名フェーズを **CPU 時間**で測る（外部負荷に強い。壁時計が5倍振れるとき用） |
+| `tools/bench_pipeline_cpu.py` | 列挙＋一意化の**パイプライン全体**を CPU 時間で測る（A/B 用） |
 | `tools/check_small_dot_bits.py` | 小さい内積/行列ベクトルがスカラ式とビット一致するかの確認 |
 | `tools/check_projection_bits.py` | 投影のバッチ化がビット一致するかの確認（しない） |
+| `tools/check_projection_axes_bits.py` | 軸/定数項だけのバッチが**ビット一致**するかの確認（する） |
+| `tools/check_projection_batching.py` | 投影の全面バッチが GEMV と一致しないことの確認（Cycle 18 の根拠） |
+| `tools/check_wl_update_inplace.py` | WL 更新の in-place 化が**ビット一致**することの確認 |
+| `tools/probe_window_size.py` | 署名バッチの窓サイズ比較（2048 が最小） |
 | `tools/scan_script_chars.py` | ソース/文書に混入した別言語の文字（文字化け）を検出 |
 | `tools/check_keys.py` | 一意数の既知値と照合する |
 | `tools/compare_partitions.py` | **高速化前後の「分割の一致」を検証する**（最重要） |
