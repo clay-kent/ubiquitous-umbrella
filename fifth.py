@@ -595,7 +595,10 @@ def layout_tree(
     u_y = precomputed["u_y"]
     face_pts = precomputed["face_pts"]
 
-    coords = []
+    # 面ごとに column_stack すると呼び出しが面数ぶん（実測 lshape で 32,544 回）。
+    # x / y を別々に貯めて最後に1回だけ結合すれば、値も行順も完全に同一。
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
     for i in range(n_faces):
         if not placed[i]:
             raise ValueError(f"面{i} へ到達できませんでした（全域木が不正です）。")
@@ -605,17 +608,17 @@ def layout_tree(
         axis_y = face_rot.T @ u_y
         shift = t - origin
         pts = face_pts[i]
-        coords_x = pts @ axis_x + float(shift @ u_x)
-        coords_y = pts @ axis_y + float(shift @ u_y)
-        coords.append(np.column_stack([coords_x, coords_y]))
+        xs.append(pts @ axis_x + float(shift @ u_x))
+        ys.append(pts @ axis_y + float(shift @ u_y))
+
+    flat = np.column_stack([np.concatenate(xs), np.concatenate(ys)])
 
     # 面を shapely の Polygon に変換する。
     #
     # 頂点数が揃っていなくても ``indices`` でまとめて作れる（shapely 2.x）。
     # Polygon() を1枚ずつ呼ぶと、頂点数が混在する立体（角錐台の底面など、
     # 8角形と四角形が混ざる）では Python 呼び出しが面数だけかかる。
-    flat = np.concatenate(coords, axis=0)
-    counts = [len(c) for c in coords]
+    counts = [len(pts) for pts in face_pts]
     indices = np.repeat(np.arange(n_faces), counts)
     built = cast(
         list[Polygon],
