@@ -602,6 +602,30 @@ def test_is_valid_layout_rejects_partial_overlap():
     assert not fifth.is_valid_layout([a, b])
 
 
+def test_is_valid_layout_bbox_overlap_shortcut_boundary():
+    """外接矩形の重なり面積による省略が、しきい値の判定を変えないことを固定する。
+
+    交差面積は外接矩形の重なり面積を超えないので、重なり面積がしきい値以下なら
+    交差計算を省略してよい（実装はこれを利用している）。境界の両側を押さえる。
+    """
+    a = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+
+    # (1) しきい値より十分小さい重なり → 「接触」とみなし有効
+    eps = 1e-9
+    tiny = Polygon([(1 - eps, 0), (2 - eps, 0), (2 - eps, 1), (1 - eps, 1)])
+    assert fifth.is_valid_layout([a, tiny])
+
+    # (2) しきい値より大きい重なり（bbox 重なり面積も大きい）→ 無効
+    overlap = Polygon([(0.999, 0.0), (1.999, 0.0), (1.999, 1.0), (0.999, 1.0)])
+    assert not fifth.is_valid_layout([a, overlap])
+
+    # (3) 省略が入っても、2 引数版と 1 引数版は常に一致する
+    assert fifth.is_valid_layout([a, tiny]) == fifth.is_valid_layout([a, tiny], set())
+    assert fifth.is_valid_layout([a, overlap]) == fifth.is_valid_layout(
+        [a, overlap], set()
+    )
+
+
 @pytest.mark.parametrize(
     "builder",
     [cube_b, tetrahedron_b, prism4_b, prism5_b],

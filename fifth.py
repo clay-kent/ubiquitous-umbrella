@@ -684,10 +684,16 @@ def is_valid_layout(
             # 閾値も0になって浮動ノイズを実重なりと誤判定するため。
             dx = max(ax1, bx1) - min(ax0, bx0)
             dy = max(ay1, by1) - min(ay0, by0)
-            if (
-                polygons[i].intersection(polygons[j]).area
-                > OVERLAP_AREA_REL_TOL * (dx * dx + dy * dy)
-            ):
+            thresh = OVERLAP_AREA_REL_TOL * (dx * dx + dy * dy)
+            # 交差面積は「外接矩形の重なり面積」を超えない。重なり面積がしきい値
+            # 以下なら交差面積もしきい値以下と確定するので、交差計算を省略できる。
+            # ここに来る時点で bbox は交差しているので ox, oy は非負。
+            # 辺や点で**接するだけ**のペア（ox か oy が 0）はここで丸ごと落ちる。
+            ox = min(ax1, bx1) - max(ax0, bx0)
+            oy = min(ay1, by1) - max(ay0, by0)
+            if ox * oy <= thresh:
+                continue
+            if polygons[i].intersection(polygons[j]).area > thresh:
                 return False
     return True
 
