@@ -52,7 +52,9 @@ def main():
             polys = fifth.layout_tree(v, faces, normals, tree, prep)
             t_layout += time.perf_counter() - t0
             t0 = time.perf_counter()
-            ok = fifth.is_valid_layout(polys)
+            ok = fifth.is_valid_layout(
+                polys, {(min(u, w), max(u, w)) for u, w in tree}
+            )
             t_valid += time.perf_counter() - t0
             if ok:
                 n_valid += 1
