@@ -498,6 +498,8 @@ def prepare_layout(
         "flat_indices": np.repeat(
             np.arange(len(faces)), [len(f) for f in faces]
         ),
+        # 全 face の 3D 座標を1本に連結したもの（投影のバッチ計算用）。
+        "flat_pts": np.concatenate([vertices[f] for f in faces]),
         # 全面の頂点数が同じなら、まとめて Polygon を作れる
         # (面u, 面v) -> (折り曲げ回転行列 r, w = p_a - r @ p_a)。
         # r は共有辺と両面の法線だけで決まるので木に依存しない。
@@ -600,31 +602,37 @@ def layout_tree(
     origin = precomputed["origin"]
     u_x = precomputed["u_x"]
     u_y = precomputed["u_y"]
-    face_pts = precomputed["face_pts"]
 
-    # 面ごとに column_stack すると呼び出しが面数ぶん（実測 lshape で 32,544 回）。
-    # x / y を別々に貯めて最後に1回だけ結合すれば、値も行順も完全に同一。
-    #
+    if not all(placed):
+        missing = next(i for i in range(n_faces) if not placed[i])
+        raise ValueError(f"面{missing} へ到達できませんでした（全域木が不正です）。")
+
     # 軸 ``u @ rot[i]`` は einsum で一括計算しても**ビット単位で同じ**
     # （``tools/check_projection_axes_bits.py``: 2万回で不一致 0）。
     # 平行移動の定数項 ``(off - origin) @ u`` も成分和にすれば同じ。
-    # これで面ごとの numpy ディスパッチを軸2回＋定数2回ぶんに圧縮できる。
     axes_x = np.einsum("b,fba->fa", u_x, rot)
     axes_y = np.einsum("b,fba->fa", u_y, rot)
     shift = off - origin
     cs_x = (shift * u_x).sum(axis=1)
     cs_y = (shift * u_y).sum(axis=1)
 
-    xs: list[np.ndarray] = []
-    ys: list[np.ndarray] = []
-    for i in range(n_faces):
-        if not placed[i]:
-            raise ValueError(f"面{i} へ到達できませんでした（全域木が不正です）。")
-        pts = face_pts[i]
-        xs.append(pts @ axes_x[i] + cs_x[i])
-        ys.append(pts @ axes_y[i] + cs_y[i])
+    # 全 face の頂点を1本の (M,3) に積み、面ごとの軸を「行ごとに繰り返した」
+    # 配列 (M,3) と成分ごとに掛けて足す。face 数ぶんの GEMV 呼び出しが
+    # 「数回のベクトル演算」に置き換わる（実測 projection が約2倍）。
+    #
+    # ⚠️ これは GEMV (`pts @ axis`) とは**丸めが一致しない**
+    # （``tools/check_projection_batch_bits.py`` / ``..._explicit_bits.py``）。
+    # 座標が 1 ULP 変わっても重なり判定はしきい値（相対1e-7）で堅牢、
+    # 面積指標の 9 桁丸めも変わらないが、**同値タイの並び順は変わり得る**。
+    # API golden（同値タイを含む）で観測差がないことを確認して採る。
+    idx_rows = precomputed["flat_indices"]
+    P = precomputed["flat_pts"]
+    AX = axes_x[idx_rows]
+    AY = axes_y[idx_rows]
+    xs = P[:, 0] * AX[:, 0] + P[:, 1] * AX[:, 1] + P[:, 2] * AX[:, 2] + cs_x[idx_rows]
+    ys = P[:, 0] * AY[:, 0] + P[:, 1] * AY[:, 1] + P[:, 2] * AY[:, 2] + cs_y[idx_rows]
 
-    flat = np.column_stack([np.concatenate(xs), np.concatenate(ys)])
+    flat = np.column_stack([xs, ys])
 
     # 面を shapely の Polygon に変換する。
     #
