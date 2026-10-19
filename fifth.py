@@ -1808,17 +1808,16 @@ def _trees_to_array(
     ).reshape(n, n_edges, 2)
 
 
-def _batch_canonical_keys(
-    ctx: RibbonContext,
-    mirror_ctx: RibbonContext,
+def _context_keys(
+    context: RibbonContext,
     trees: list[list[tuple[int, int]]],
-) -> list[tuple[Any, Any]]:
-    """窓内の全木について (自身の正規形, 鏡像の正規形) を返す。
+    edges_arr: npt.NDArray[np.intp] | None = None,
+) -> list[bytes]:
+    """1 つの文脈（巻き順）で、窓の全木の正規形キーを返す。
 
-    項目の並びは ``trees`` の順。各行は plain WL の安定化までバッチで回し、
-    その色がすべて別色ならそのまま正規形キーにする。まだ残ったセルがある場合は
-    既存の :func:`_individualize_refine`（個別化-細分）に回す。予算超過の判定と
-    ``SolidError`` の送出手続きはそちらと同一。
+    行（木）ごとに独立な計算なので、``trees`` を**窓の一部だけにしても
+    その行の結果は変わらない**。この性質が :func:`iter_unique_nets` の
+    「鏡像の正規形は必要な行だけ計算する」高速化の根拠になっている。
 
     キーは行によらず bytes。全色が別の行は「ソート済みの色列をビッグエンディアンで
     並べた 8 バイト/色の連結」、個別化に回った行は :func:`_key_bytes` による
@@ -1829,55 +1828,72 @@ def _batch_canonical_keys(
     （個別化行の色数は n_nodes 未満で、全色が別の行にはなれない）。
     """
     n = len(trees)
-    keys: list[Any] = [None] * (2 * n)
+    keys: list[bytes] = cast(list[bytes], [None] * n)
     if n == 0:
         return keys
-
-    # すべての木は F-1 本の辺を持つ（全域木の定義）。辺の (u, v) を
-    # (n, F-1, 2) の配列に一括変換すれば、位置 p は adj_pos_matrix の
-    # ファンシー索引1回で求まる（以前は木×辺の Python 内包 + dict 引き）。
-    edges_arr = _trees_to_array(trees, len(trees[0]))
-
-    for ctx_i, context in enumerate((ctx, mirror_ctx)):
-        # 位置の付け直しは**文脈ごと**に行う。build_edge_map は Dict の挿入順で
-        # 辺を列挙するので、面の巻き順を反転すると同じ辺でも位置番号が変わる。
-        # ctx の位置を鏡像文脈でそのまま使うと別の辺を指し、
-        # 鏡像が同一視されずに一意数が倍増する（実測: cube が 11 -> 30）。
-        positions = context.adj_pos_matrix[edges_arr[:, :, 0], edges_arr[:, :, 1]]
-        partner, flip = _glue_batch(context, positions)
-        colors, counts = _batch_stabilize(context, partner, flip)
-        offset = ctx_i * n
-        nxt_list = context.nxt
-        n_nodes = context.n_nodes
-        rows_need_individualization = np.flatnonzero(counts != n_nodes)
-        for idx in rows_need_individualization.tolist():
-            # 色細分が止まったセルから個別化する。
-            keys[offset + idx] = _key_bytes(
-                _individualize_refine(
-                    nxt_list,
-                    partner[idx].tolist(),
-                    flip[idx].tolist(),
-                    colors[idx].tolist(),
-                    [0],
-                )
+    if edges_arr is None:
+        edges_arr = _trees_to_array(trees, len(trees[0]))
+    # 位置の付け直しは**文脈ごと**に行う。build_edge_map は Dict の挿入順で
+    # 辺を列挙するので、面の巻き順を反転すると同じ辺でも位置番号が変わる。
+    # 片方の位置を他方で流用すると別の辺を指し、鏡像が同一視されずに
+    # 一意数が倍増する（実測: cube が 11 -> 30）。
+    positions = context.adj_pos_matrix[edges_arr[:, :, 0], edges_arr[:, :, 1]]
+    partner, flip = _glue_batch(context, positions)
+    colors, counts = _batch_stabilize(context, partner, flip)
+    nxt_list = context.nxt
+    n_nodes = context.n_nodes
+    # 色細分が止まったセルから個別化する。
+    for idx in np.flatnonzero(counts != n_nodes).tolist():
+        keys[idx] = _key_bytes(
+            _individualize_refine(
+                nxt_list,
+                partner[idx].tolist(),
+                flip[idx].tolist(),
+                colors[idx].tolist(),
+                [0],
             )
-        # 全半辺が別色になった行 = 色列そのものが完全な同型判定になる。
-        # ソートして並べた色列がそのまま正規形キー。行ごとの sorted() を
-        # 呼ばず、軸1の numpy ソートで一括する。
-        #
-        # ⚠️ キーはタプルではなく**ビッグエンディアンのバイト列**にする。
-        # tuple にすると ``.tolist()`` で (2048, 48) ぶんの Python int を
-        # 作ることになり、この行が署名フェーズの1割を占めていた（実測 0.44s）。
-        # ビッグエンディアンならバイト列の辞書順は uint64 の数値順と一致し、
-        # 固定幅の連結はタプルの辞書順と一致するので、``min(自身, 鏡像)`` の
-        # 選び方まで tuple 版と**完全に同じ**（= 代表として選ばれる木が変わらない）。
-        rows_distinct = np.flatnonzero(counts == n_nodes)
-        if rows_distinct.size:
-            flat = np.sort(colors, axis=1).astype(">u8").tobytes()
-            stride = n_nodes * 8
-            for idx in rows_distinct.tolist():
-                keys[offset + idx] = flat[idx * stride : (idx + 1) * stride]
-    return list(zip(keys[:n], keys[n:]))
+        )
+    # 全半辺が別色になった行 = 色列そのものが完全な同型判定になる。
+    # ソートして並べた色列がそのまま正規形キー。行ごとの sorted() を
+    # 呼ばず、軸1の numpy ソートで一括する。
+    #
+    # ⚠️ キーはタプルではなく**ビッグエンディアンのバイト列**にする。
+    # tuple にすると ``.tolist()`` で (2048, 48) ぶんの Python int を
+    # 作ることになり、この行が署名フェーズの1割を占めていた（実測 0.44s）。
+    # ビッグエンディアンならバイト列の辞書順は uint64 の数値順と一致し、
+    # 固定幅の連結はタプルの辞書順と一致するので、``min(自身, 鏡像)`` の
+    # 選び方まで tuple 版と**完全に同じ**（= 代表として選ばれる木が変わらない）。
+    rows_distinct = np.flatnonzero(counts == n_nodes)
+    if rows_distinct.size:
+        flat = np.sort(colors, axis=1).astype(">u8").tobytes()
+        stride = n_nodes * 8
+        for idx in rows_distinct.tolist():
+            keys[idx] = flat[idx * stride : (idx + 1) * stride]
+    return keys
+
+
+def _batch_canonical_keys(
+    ctx: RibbonContext,
+    mirror_ctx: RibbonContext,
+    trees: list[list[tuple[int, int]]],
+) -> list[tuple[Any, Any]]:
+    """窓内の全木について (自身の正規形, 鏡像の正規形) を返す。
+
+    項目の並びは ``trees`` の順。**全行を計算する参照実装**で、
+    :func:`iter_unique_nets` はこの結果のうち必要な行だけを :func:`_context_keys`
+    で直接計算する（鏡像の正規形が要る行は「窓で最初に現れる新しいキー」だけ）。
+
+    キーの作り方と同型判定の性質は :func:`_context_keys` の docstring 参照。
+    """
+    if not trees:
+        return []
+    edges_arr = _trees_to_array(trees, len(trees[0]))
+    return list(
+        zip(
+            _context_keys(ctx, trees, edges_arr),
+            _context_keys(mirror_ctx, trees, edges_arr),
+        )
+    )
 
 
 def iter_unique_nets(
@@ -1891,9 +1907,20 @@ def iter_unique_nets(
     重複は「正規形（同型なら必ず一致するキー）」で潰す。
     鏡像も同一視するので、自身と鏡像の正規形の小さい方をキーにする。
 
-    シグネ計算は窓単位でバッチ化する（:_batch_canonical_keys 参照）。
+    シグネ計算は窓単位でバッチ化する（:_context_keys 参照）。
     窓内では木の順序に従って重複判定・展開・重なり判定をするので、
     返り値の順序は木ごとの列挙順と一致する。
+
+    **鏡像の正規形は、要る行だけ計算する**（全体の 1/2 近くがこれで消える）。
+    「自身のキー sig が既出 ⟹ その木は既に登録済みのクラス」なので、
+    sig が新しい行だけ鏡像を計算すればよい。根拠:
+
+    * 正規形が等しい2つの木は同型（正規形は完全な同型判定。
+      ``test_batched_and_per_tree_signatures_agree_on_uniqueness``）。
+    * 鏡像のキーは「鏡像文脈で測った正規形」で、鏡像の鏡像は元に戻る。
+      よって ``sig(T) == mirror(T')`` なら ``T`` は ``T'`` の鏡像と同型。
+    * クラスのキー ``min(sig, mirror)`` は同型類の関数（鏡像は同一視）なので、
+      どの経路で見つけても同じキーになり、``exact_seen`` の判定は変わらない。
 
     ⚠️ このループを ``except ValueError`` で包まないこと。
     そうするとループ中のあらゆる ValueError（予算超過を含む）が
@@ -1904,7 +1931,11 @@ def iter_unique_nets(
     mirror_ctx = RibbonContext(vertices, [list(reversed(f)) for f in faces])
     layout_prep = prepare_layout(vertices, faces, normals)
 
-    exact_seen: set[tuple[Color, ...]] = set()
+    exact_seen: set[bytes] = set()
+    # 自身/鏡像の正規形として既に見た値。「ここに入っている sig の木は
+    # 登録済みクラス」という不変条件を保つ（キーが既出だった場合も含めて
+    # 登録時に必ず入れる。クラスのキーは変わらないので過剰な除外にはならない）。
+    seen_side: set[bytes] = set()
 
     rest = iter(all_trees)
     while True:
@@ -1917,7 +1948,19 @@ def iter_unique_nets(
         # 同じ正規形の木は展開図が合同であり重なり判定の結果まで一致する
         # （test_unique_nets_geometry.py で独立に検証済み）ため、順序を入れ替えても
         # 返り値は変わらない。
-        key_pairs = _batch_canonical_keys(ctx, mirror_ctx, window)
+        edges_arr = _trees_to_array(window, len(faces) - 1)
+        sigs = _context_keys(ctx, window, edges_arr)
+
+        # 鏡像の正規形が要るのは「窓の中で最初に現れる、まだ見ていない sig」の行。
+        # 窓内の重複（同じ sig の2本目以降）はこの時点で落ちる。
+        fresh: list[int] = []
+        for i, sig in enumerate(sigs):
+            if sig in seen_side:
+                continue
+            seen_side.add(sig)
+            fresh.append(i)
+        mirrors = _context_keys(mirror_ctx, [window[i] for i in fresh])
+        mirror_of = dict(zip(fresh, mirrors))
 
         # 窓内で一意な木を集めてから、展開をまとめて行う。
         # 1 本ずつ layout_tree を呼ぶと numpy 呼び出しの固定費が支配的なので、
@@ -1925,9 +1968,16 @@ def iter_unique_nets(
         # 重複判定は木の順序どおりに済ませてから展開するので、返り値の順序は
         # 従来と完全に一致する（重複判定は展開結果に依存しない）。
         pending: list[list[tuple[int, int]]] = []
-        for tree, (sig, mirror_sig) in zip(window, key_pairs):
+        for i, tree in enumerate(window):
+            mirror_sig = mirror_of.get(i)
+            if mirror_sig is None:
+                # sig が既出 = 既に登録済みのクラス（上の docstring の根拠）。
+                continue
+            sig = sigs[i]
             # キーを先に登録してあるので、同型な木は展開せずに弾ける。
             key = min(sig, mirror_sig)
+            # キーが既出でも sig / 鏡像は「処理済みクラスの正規形」なので登録する。
+            seen_side.add(mirror_sig)
             if key in exact_seen:
                 continue
             exact_seen.add(key)

@@ -859,7 +859,7 @@ def test_errors_inside_the_tree_loop_propagate():
     **静かに誤った一意数**を返していた。
 
     このテストは正常系ではなく guard である:
-    正規形の計算経路（窓単位バッチの ``_batch_canonical_keys``）に注入して、
+    正規形の計算経路（窓単位バッチの ``_context_keys``）に注入して、
     例外がそのまま呼び出し元へ届くことを確かめる。
     """
     v, f = cube()
@@ -868,26 +868,26 @@ def test_errors_inside_the_tree_loop_propagate():
     trees = list(fifth.enumerate_spanning_trees(fifth.build_adjacency_graph(f), len(f)))
 
     boom = ValueError("-loop-boom-")
-    original = fifth._batch_canonical_keys
+    original = fifth._context_keys
     original_window = fifth._LADDER_WINDOW
 
     calls = {"n": 0}
 
-    def exploding(ctx, mirror_ctx, window):
+    def exploding(context, window, edges_arr=None):
         calls["n"] += 1
         if calls["n"] >= 2:
             raise boom
-        return original(ctx, mirror_ctx, window)
+        return original(context, window, edges_arr)
 
     # 窓を小さくして「2窓目」で例外が起きるようにする
     # （立方体の 384 木は既定窓 2048 に収まるので、そのままでは1回しか呼ばれない）
     fifth._LADDER_WINDOW = 16
-    fifth._batch_canonical_keys = exploding
+    fifth._context_keys = exploding
     try:
         with pytest.raises(ValueError, match="loop-boom"):
             list(fifth.iter_unique_nets(v, faces, iter(trees), normals))
     finally:
-        fifth._batch_canonical_keys = original
+        fifth._context_keys = original
         fifth._LADDER_WINDOW = original_window
 
 
