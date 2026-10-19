@@ -1402,6 +1402,21 @@ _WL_E = np.uint64(0x85EBCA77C2B2AE63)
 _WL_E0 = np.uint64(0xD6E8FEB86659FD93)
 _WL_D0 = np.uint64(0xA0761D6478BD642F)
 
+# 色数を数え始めるラウンド。実測（stairs）では 7 ラウンド目までに安定する行は
+# 2048 行中 182 行だけで、1〜6 ラウンド目はほぼ全部が残る。その区間の
+# `_distinct_counts` はほぼ捨て仕事なので、数えないで進める（署名フェーズ約15%減）。
+#
+# ⚠️ これは速度だけでなく**正しさのためにも効く**。バッチ版の色は
+# ``A*h[i] + B*h[nxt] + C*h[partner] + ...`` という uint64 の線形結合なので、
+# 早期のラウンドでは値の線形従属が残っていて衝突が多い。実測（lshape, 8100 行）
+# では 3 ラウンド目で 66 行、4 ラウンド目で 28 行が「実際のクラス数より 1 少ない」
+# 色数になり、そのせいで「分割が起きたのに色数が変わらない」＝**見かけの安定**が
+# 起きる（旧実装では lshape の 9 行がここで早期に凍結し、個別化で拾い直していた）。
+# 5 ラウンド目以降は衝突 0 なので、その手前を数えないことで偽の安定を取り込まない。
+# 途中で安定した行もここまで回すが、安定後の WL は分割を変えず値だけが決定的に
+# 進むので正規形としては同じ。全行が同じ回数以上回るので同型判定も保たれる。
+_WL_MIN_ROUNDS = 5
+
 
 def _glue_batch(
     ctx: RibbonContext, positions: np.ndarray
@@ -1448,6 +1463,11 @@ def _batch_stabilize(
     戻り値: (安定化後の色 (uint64), 各行の色数)。各行は「色数が初めて増えなかった
     ラウンド」の値で凍結する。_wl_refine のバッチ版。
 
+    ただし最初の ``_WL_MIN_ROUNDS`` ラウンドは色数を数えない（下の説明を参照）。
+    安定した行は以降のラウンドで分割も色も変化しないので、計算対象から外しても
+    結果は変わらない。分割が木ごと版と一致することは tools/compare_partitions.py で
+    確認している（box / frustum4 で 96 クラス一致）。
+
     partner の -1（接着なし）は「接着相手の色」を 0 に落として区別する。
     ラウンドの回数は行ごとに違うので、安定した行は以降の計算から外す。
     """
@@ -1464,7 +1484,6 @@ def _batch_stabilize(
     uniq = np.unique(ctx.np_edge_len)
     eid = np.searchsorted(uniq, ctx.np_edge_len).astype(np.uint64)
     h = eid[None, :] * _WL_E0 + tag
-    counts = _distinct_counts(h)
 
     nxt = ctx.np_nxt
     n_rows = len(h)
@@ -1476,7 +1495,19 @@ def _batch_stabilize(
     out_colors = np.empty((n_rows, n_nodes), dtype=np.uint64)
     out_counts = np.empty(n_rows, dtype=np.int64)
 
+    # 最初の _WL_MIN_ROUNDS ラウンドは色数を数えない。
+    # 実測（tools/probe_stabilize_parts.py、stairs）では 7 ラウンド目までに
+    # 安定する行は 2048 行中 182 行だけで、1〜6 ラウンド目はほぼ全部が残る。
+    # その区間の `_distinct_counts`（ラウンド費用の約 3 割）はほぼ捨て仕事になる。
+    #
+    # 途中で安定した行も _WL_MIN_ROUNDS までは回すが、安定後の WL は分割を
+    # 変えず色の値だけが決定的に進むので、**正規形としては同じ**。
+    # 全行が同じ回数以上回るため「同型なら同じキー」も保たれる。
+    counts: npt.NDArray[np.int64] | None = None
+    rnd = 0
+
     while True:
+        rnd += 1
         # ⚠️ 1 本の式で書くと (rows, n_nodes) の一時配列が 9 個でき、このサイズ
         # （実測 stairs で 2048 x 48 uint64 = 786 KB）ではそれが支配的になる。
         # 逐次 in-place にすると確保は 3 個で済む。値を足す順序は元の式と同一なので
@@ -1490,6 +1521,14 @@ def _batch_stabilize(
         t2 *= partner_coef
         nh += t2
         nh += tag
+        if rnd <= _WL_MIN_ROUNDS:
+            # 色数を数えずに次へ。この区間では行の間引きもしない（ほぼ空振り）。
+            h = nh
+            if rnd < _WL_MIN_ROUNDS:
+                continue
+            counts = _distinct_counts(nh)
+            continue
+        assert counts is not None
         new_counts = _distinct_counts(nh)
         # 安定した行は値を確定して以降から外す。h / counts / row_ids は
         # 常に同じ長さで、keep で同時に縮める（片方だけ縮めると壊れる）。
