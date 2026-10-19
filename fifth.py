@@ -1495,32 +1495,60 @@ def _batch_stabilize(
     out_colors = np.empty((n_rows, n_nodes), dtype=np.uint64)
     out_counts = np.empty(n_rows, dtype=np.int64)
 
+    # 作業配列は最大行数で確保して使い回す。
+    # ⚠️ ラウンドごとに (行, n_nodes) の一時配列を新規確保すると、その実体化
+    # （初回書き込みのページフォルト）だけで更新1回あたり数百 us を払う。
+    # 実測（2048x48）: 確保あり 1250us → 事前確保 + 平坦添字 gather 469us = 2.7 倍。
+    # 出力バッファは 2 枚を交互に使う（入力 h と別でなければ壊れる）。
+    t_buf = np.empty((n_rows, n_nodes), dtype=np.uint64)
+    t2_buf = np.empty((n_rows, n_nodes), dtype=np.uint64)
+    nh_a = np.empty((n_rows, n_nodes), dtype=np.uint64)
+    nh_b = np.empty((n_rows, n_nodes), dtype=np.uint64)
+    flat_buf = np.empty((n_rows, n_nodes), dtype=np.intp)
+    use_a = True
+    # 接着相手の色を引く添字。行ごとに変わるので 2 次元 gather
+    # （take_along_axis は実測 260us）より、平坦化した 1 次元 gather
+    # （実測 52us）のほうが速い。行番号が変わる（= 行を間引く）たびに
+    # 行オフセットを掛け直すので、partner_or_self は h と同じく詰め替える。
+    row_off = np.arange(n_rows, dtype=np.intp)[:, None] * n_nodes
+
     # 最初の _WL_MIN_ROUNDS ラウンドは色数を数えない。
     # 実測（tools/probe_stabilize_parts.py、stairs）では 7 ラウンド目までに
     # 安定する行は 2048 行中 182 行だけで、1〜6 ラウンド目はほぼ全部が残る。
     # その区間の `_distinct_counts`（ラウンド費用の約 3 割）はほぼ捨て仕事になる。
     #
-    # 途中で安定した行も _WL_MIN_ROUNDS までは回すが、安定後の WL は分割を
-    # 変えず色の値だけが決定的に進むので、**正規形としては同じ**。
-    # 全行が同じ回数以上回るため「同型なら同じキー」も保たれる。
+    # ⚠️ これは速度だけでなく**正しさのためにも効く**。バッチ版の色は
+    # ``A*h[i] + B*h[nxt] + C*h[partner] + ...`` という uint64 の線形結合なので、
+    # 早期のラウンドでは値の線形従属が残っていて衝突が多い。実測（lshape, 8100 行）
+    # では 3 ラウンド目で 66 行、4 ラウンド目で 28 行が「実際のクラス数より 1 少ない」
+    # 色数になり、そのせいで「分割が起きたのに色数が変わらない」＝**見かけの安定**が
+    # 起きる（旧実装では lshape の 9 行がここで早期に凍結し、個別化で拾い直していた）。
+    # 5 ラウンド目以降は衝突 0 なので、その手前を数えないことで偽の安定を取り込まない。
+    # 途中で安定した行もここまで回すが、安定後の WL は分割を変えず値だけが決定的に
+    # 進むので正規形としては同じ。全行が同じ回数以上回るので同型判定も保たれる。
     counts: npt.NDArray[np.int64] | None = None
     rnd = 0
 
     while True:
         rnd += 1
-        # ⚠️ 1 本の式で書くと (rows, n_nodes) の一時配列が 9 個でき、このサイズ
-        # （実測 stairs で 2048 x 48 uint64 = 786 KB）ではそれが支配的になる。
-        # 逐次 in-place にすると確保は 3 個で済む。値を足す順序は元の式と同一なので
-        # **ビット単位で同じ**（uint64 の掛け算・足し算は順序で値が変わり得るため、
-        # 順序を崩さないことだけが条件）。CPU 時間で約 1.7 倍速い。
-        nh = h * _WL_A
-        t = h[:, nxt]
-        t *= _WL_B
-        nh += t
-        t2 = np.take_along_axis(h, partner_or_self, axis=1)
-        t2 *= partner_coef
-        nh += t2
-        nh += tag
+        n = len(h)
+        # ⚠️ 入力 h と出力 nh は必ず別の実体にする（2 枚を交互に使う）。
+        nh = (nh_a if use_a else nh_b)[:n]
+        use_a = not use_a
+        t = t_buf[:n]
+        t2 = t2_buf[:n]
+        # 1 本の式で書くと (rows, n_nodes) の一時配列が 9 個できる。逐次 in-place
+        # なら確保は 0 個。値を足す順序は元の式と同一なので**ビット単位で同じ**
+        # （uint64 の掛け算・足し算は順序で値が変わり得るので、順序は崩さない）。
+        np.multiply(h, _WL_A, out=nh)
+        np.copyto(t, h[:, nxt])
+        np.multiply(t, _WL_B, out=t)
+        np.add(nh, t, out=nh)
+        np.add(partner_or_self, row_off[:n], out=flat_buf[:n])
+        np.copyto(t2, h.reshape(-1)[flat_buf[:n].reshape(-1)].reshape(n, n_nodes))
+        np.multiply(t2, partner_coef, out=t2)
+        np.add(nh, t2, out=nh)
+        np.add(nh, tag, out=nh)
         if rnd <= _WL_MIN_ROUNDS:
             # 色数を数えずに次へ。この区間では行の間引きもしない（ほぼ空振り）。
             h = nh
