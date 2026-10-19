@@ -1,6 +1,6 @@
 import math
 from collections.abc import Iterable, Iterator
-from itertools import islice
+from itertools import chain, islice
 from typing import Any, NamedTuple, cast
 
 import numpy as np
@@ -1708,6 +1708,27 @@ def _key_bytes(colors: Iterable[Color]) -> bytes:
     return bytes(out)
 
 
+def _trees_to_array(
+    trees: list[list[tuple[int, int]]], n_edges: int
+) -> npt.NDArray[np.intp]:
+    """全域木のリストを ``(n, F-1, 2)`` の辺配列に落とす。
+
+    ``np.asarray(trees, dtype=np.int64)`` は「木のリスト → 辺のタプル」という
+    入れ子を汎用の object 経路で走るので遅い（実測 stairs の 2048 本で 2.5ms）。
+    平坦な int 列を ``np.fromiter`` に流して整形すると 0.83ms（3.0x）。
+
+    要素の並び（木の順 → 辺の順 → ``u``, ``v`` の順）は `np.asarray` と同一で、
+    値も完全に一致する（tools/probe_asarray.py で照合）。戻り値は添字に使うので
+    ``intp``。
+    """
+    n = len(trees)
+    return np.fromiter(
+        chain.from_iterable(chain.from_iterable(trees)),
+        dtype=np.intp,
+        count=n * n_edges * 2,
+    ).reshape(n, n_edges, 2)
+
+
 def _batch_canonical_keys(
     ctx: RibbonContext,
     mirror_ctx: RibbonContext,
@@ -1730,11 +1751,13 @@ def _batch_canonical_keys(
     """
     n = len(trees)
     keys: list[Any] = [None] * (2 * n)
+    if n == 0:
+        return keys
 
     # すべての木は F-1 本の辺を持つ（全域木の定義）。辺の (u, v) を
     # (n, F-1, 2) の配列に一括変換すれば、位置 p は adj_pos_matrix の
     # ファンシー索引1回で求まる（以前は木×辺の Python 内包 + dict 引き）。
-    edges_arr = np.asarray(trees, dtype=np.int64)
+    edges_arr = _trees_to_array(trees, len(trees[0]))
 
     for ctx_i, context in enumerate((ctx, mirror_ctx)):
         # 位置の付け直しは**文脈ごと**に行う。build_edge_map は Dict の挿入順で
@@ -1839,7 +1862,7 @@ def iter_unique_nets(
         # 交差計算は 1 本ずつ逐次に early-exit するので、結果は
         # is_valid_layout を順に呼んだ場合とビット単位で同じ。
         ok_flags = _valid_batch(
-            all_polys, bnds, np.asarray(pending, dtype=np.intp)
+            all_polys, bnds, _trees_to_array(pending, len(faces) - 1)
         )
         for tree, polys, ok in zip(pending, all_polys, ok_flags):
             if not ok:

@@ -43,7 +43,7 @@ def main() -> None:
             break
         n = len(window)
         t0 = time.perf_counter()
-        edges_arr = np.asarray(window, dtype=np.int64)
+        edges_arr = fifth._trees_to_array(window, len(window[0]))
         t = time.perf_counter()
         clocks["asarray"] += t - t0
         for context in (ctx, mirror_ctx):

@@ -97,6 +97,7 @@ def main() -> None:
     # 系統誤差がそのまま比に出る（1 ラウンド 5 秒級なので負荷のドリフトも入る）。
     # 奇数ラウンドで順序を入れ替え、**ペアごとの比の中央値**を取る。
     pairs: list[tuple[float, float]] = []
+    stab_pairs: list[tuple[float, float]] = []
     for r in range(rounds):
         order = [("new", fifth, acc_new), ("old", old, acc_old)]
         if r % 2 == 1:
@@ -115,12 +116,15 @@ def main() -> None:
             print(f"    {label}: {dts[label]:7.3f}s   stabilize={acc['stabilize']:6.3f}s "
                   f"({acc['calls']:.0f} calls)")
         pairs.append((dts["new"], dts["old"]))
+        stab_pairs.append((dts["stab_new"], dts["stab_old"]))
     ratios = sorted(o / n for n, o in pairs)
     med = ratios[len(ratios) // 2]
     print(f"  total ratio old/new per round: "
           f"{' '.join(f'{o / n:.3f}' for n, o in pairs)}  median={med:.3f}x")
-    print(f"  stabilize new {min(p[0] for p in pairs):.3f}s+   old "
-          f"{min(p[1] for p in pairs):.3f}s+")
+    sratios = sorted(o / n for n, o in stab_pairs)
+    smed = sratios[len(sratios) // 2]
+    print(f"  stabilize min new {min(n for n, _o in stab_pairs):.3f}s   old "
+          f"{min(o for _n, o in stab_pairs):.3f}s   median ratio={smed:.3f}x")
 
 
 if __name__ == "__main__":

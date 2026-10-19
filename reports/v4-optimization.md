@@ -848,6 +848,22 @@ stairs の layout 5.3s → 0.88s、パイプライン 13.2s → 7.4s（CPU 時�
 - `_batch_stabilize` は細かいタイマで **6%**（ペア 6 ラウンドの最小値）。
 - パイプライン全体では 2% 級で、計測の分解能の内側。
 
+### Cycle 26: 窓の木を配列に落とす経路 — **採用（ビット一致）**
+
+`_batch_canonical_keys` は毎窓 `np.asarray(window, dtype=np.int64)` で「木のリスト →
+辺のタプル」という入れ子を配列に落としていた。numpy の汎用 object 経路は 1 要素
+あたり 50ns 級で、stairs の 2048 本（36,864 個の int）で **2.5ms/窓**かかる。
+
+平坦な int 列を `np.fromiter` に流すと **0.83ms（3.0x）**。要素の並び（木の順 →
+辺の順 → `u`, `v` の順）は同じなので値も配列の形も完全に一致する
+（`tools/probe_asarray.py` で `np.array_equal` を照合）。`_trees_to_array` として
+切り出し、`_valid_batch` に渡す `pending` の変換も同じ経路にした。
+
+- 部位計測（`tools/probe_keys_parts.py`）: asarray 枠が 0.24s → **0.073s**。
+  stairs のパイプラインの約 3%。
+- ペア計測: stairs の中央値 1.039x（6 ラウンド）/ 1.006x（4 ラウンド）。
+  3% 級はノイズ床（約2%）の境目なので、上の部位計測を主な根拠にしている。
+
 ### 計測手法（このラウンドで確立したこと）— ここが第2ラウンドの主な成果
 
 このマシンは外部負荷で **壁時計が最大 5 倍**振れる。さらに **`time.process_time`
