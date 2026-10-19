@@ -7,6 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
+
 import fifth
 from bench_ladder import SOLIDS
 
@@ -55,16 +57,13 @@ def main():
 
         # 本番（iter_unique_nets）と同じく窓単位でまとめて展開する。
         t0 = time.perf_counter()
-        all_polys = fifth._layout_batch(len(faces), pending, prep)
+        all_polys, bnds = fifth._layout_batch(len(faces), pending, prep)
         t_layout += time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        for tree, polys in zip(pending, all_polys):
-            ok = fifth.is_valid_layout(
-                polys, {(min(u, w), max(u, w)) for u, w in tree}
-            )
-            if ok:
-                n_valid += 1
+        n_valid += sum(
+            fifth._valid_batch(all_polys, bnds, np.asarray(pending, dtype=np.intp))
+        )
         t_valid += time.perf_counter() - t0
 
     print(f"{name}: trees={len(trees)} unique_keys={n_unique} valid={n_valid}")

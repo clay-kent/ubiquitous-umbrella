@@ -678,7 +678,7 @@ def _layout_batch(
     n_faces: int,
     trees: list[list[tuple[int, int]]],
     precomputed: Layout,
-) -> list[list[Polygon]]:
+) -> tuple[list[Any], npt.NDArray[np.float64]]:
     """窓内の複数の木をまとめて展開する（:func:`layout_tree` と同じ結果）。
 
     1 本ずつ ``layout_tree`` を呼ぶと、面数が 10 程度では**計算量ではなく
@@ -696,11 +696,13 @@ def _layout_batch(
     - 投影の成分ごとの積和は要素ごとの演算なので一致。
     - ``linearrings`` は ring ごとに独立なので、座標を連結しても同じ ring になる。
 
-    ``trees`` の順に Polygon のリストを返す。
+    ``trees`` の順に Polygon のリストを返す。あわせて各ポリゴンの外接矩形
+    （``(B, F, 4)`` の ``[minx, miny, maxx, maxy]``）を返す
+    （:func:`_valid_batch` の事前絞り込み用）。
     """
     n_batch = len(trees)
     if n_batch == 0:
-        return []
+        return [], np.empty((0, n_faces, 4), dtype=np.float64)
     n_edges = n_faces - 1
 
     par = np.empty((n_batch, n_edges), dtype=np.int64)
@@ -772,7 +774,12 @@ def _layout_batch(
     # 実行時は numpy の object array だが、添字で切って list にすれば同じ。
     built = cast(list[Polygon], shapely.polygons(rings))
 
-    return [built[b * n_faces : (b + 1) * n_faces] for b in range(n_batch)]
+    # 外接矩形も一緒に返す。:func:`_valid_batch` が交差計算の前に
+    # 「外接矩形が重なる面対」を numpy で一括で絞り込むのに要る
+    # （1 本ずつ ``polygons[i].bounds`` を取ると呼び出し回数だけで 0.3 秒食う）。
+    bnds = np.asarray(shapely.bounds(built), dtype=np.float64).reshape(n_batch, n_faces, 4)
+
+    return [built[b * n_faces : (b + 1) * n_faces] for b in range(n_batch)], bnds
 
 
 def is_valid_layout(
@@ -835,6 +842,93 @@ def is_valid_layout(
             if polygons[i].intersection(polygons[j]).area > thresh:
                 return False
     return True
+
+
+def pair_table(n_faces: int) -> tuple[list[tuple[int, int]], npt.NDArray[np.intp]]:
+    """面対 ``(i, j)``（``i < j``）を :func:`is_valid_layout` と同じ順に並べる。
+
+    順序は ``i`` 昇順 → ``j`` 昇順。返すのは (面対のリスト, ``(i, j)`` から
+    その添字を引く表)。表は ``(n_faces, n_faces)`` で、``i > j`` でも同じ
+    添字を返す（折り線の面対は ``(min, max)`` で来るため）。
+    """
+    pairs = [(i, j) for i in range(n_faces) for j in range(i + 1, n_faces)]
+    idx = np.full((n_faces, n_faces), -1, dtype=np.intp)
+    for p, (i, j) in enumerate(pairs):
+        idx[i, j] = p
+        idx[j, i] = p
+    return pairs, idx
+
+
+def _valid_batch(
+    polys_list: list[Any],
+    bnds: npt.NDArray[np.float64],
+    trees_arr: npt.NDArray[np.intp],
+) -> list[bool]:
+    """窓内の全展開図の重なり判定を、**外接矩形の絞り込みだけ**一括で行う。
+
+    :func:`is_valid_layout` の判定式をそのまま numpy で、しかも窓の全ネットに
+    まとめて適用する。1 本ずつだと面数の2乗（面数 10 で 45）回る Python の
+    二重ループと、ネットごとの ``shapely.bounds`` / ``.tolist()`` の固定費が
+    支配的になる（実測 stairs で 2.5 秒のうち 8 割）。
+
+    交差計算そのものは**逐次・早期終了**のまま（重なりを見つけた時点で
+    打ち切るので、全ペアを計算するより速い。stairs では交差 51,605 回に対し
+    候補 124,039 ペア）。ここでやるのは「交差計算に進む面対」の絞り込みだけで、
+    式も順序も :func:`is_valid_layout` と同一。よって呼ぶ intersection の回数も
+    順序も完全に一致し、結果はビット単位で同じ。
+
+    ``trees_arr`` は ``(B, F-1, 2)`` の辺（折り線を共有する面対は重ならないので
+    候補から外す）。
+    """
+    n_batch = len(polys_list)
+    if n_batch == 0:
+        return []
+    n_faces = bnds.shape[1]
+    if n_faces < 2:
+        return [True] * n_batch
+    pairs, pair_idx = pair_table(n_faces)
+    pair_i = np.array([i for i, _ in pairs], dtype=np.intp)
+    pair_j = np.array([j for _, j in pairs], dtype=np.intp)
+
+    # 面対ごとの外接矩形を (B, n_pairs) に引き伸ばし、判定を全部まとめて行う。
+    bi = bnds[:, pair_i, :]
+    bj = bnds[:, pair_j, :]
+    ax0, ay0, ax1, ay1 = bi[:, :, 0], bi[:, :, 1], bi[:, :, 2], bi[:, :, 3]
+    bx0, by0, bx1, by1 = bj[:, :, 0], bj[:, :, 1], bj[:, :, 2], bj[:, :, 3]
+    near = (ax1 >= bx0) & (bx1 >= ax0) & (ay1 >= by0) & (by1 >= ay0)
+    dx = np.maximum(ax1, bx1) - np.minimum(ax0, bx0)
+    dy = np.maximum(ay1, by1) - np.minimum(ay0, by0)
+    thresh = OVERLAP_AREA_REL_TOL * (dx * dx + dy * dy)
+    ox = np.minimum(ax1, bx1) - np.maximum(ax0, bx0)
+    oy = np.minimum(ay1, by1) - np.maximum(ay0, by0)
+    cand = near & (ox * oy > thresh)
+    # 折り線を共有する面対は展開図でも線の反対側に並ぶので重ならない
+    # （交差面積は浮動ノイズのみ）。交差計算を丸ごと省く。
+    cand[np.arange(n_batch, dtype=np.intp)[:, None], pair_idx[trees_arr[:, :, 0], trees_arr[:, :, 1]]] = False
+
+    # 交差計算に進む面対を、:func:`is_valid_layout` と同じ順（ネットごとに
+    # 添字昇順）で取り出して、ネットごとに逐次・早期終了で回す。
+    rows, cols = np.nonzero(cand)
+    out = [True] * n_batch
+    if rows.size == 0:
+        return out
+    counts = np.bincount(rows, minlength=n_batch)
+    col_list = cols.tolist()
+    thr_list = thresh[rows, cols].tolist()
+    pos = 0
+    for k in range(n_batch):
+        n_cand = int(counts[k])
+        if n_cand == 0:
+            continue
+        polys = polys_list[k]
+        end = pos + n_cand
+        for t in range(pos, end):
+            i, j = pairs[col_list[t]]
+            if polys[i].intersection(polys[j]).area > thr_list[t]:
+                out[k] = False
+                break
+        pos = end
+    return out
 
 
 class NetMetrics(NamedTuple):
@@ -1726,12 +1820,15 @@ def iter_unique_nets(
 
         if not pending:
             continue
-        all_polys = _layout_batch(len(faces), pending, layout_prep)
+        all_polys, bnds = _layout_batch(len(faces), pending, layout_prep)
 
-        for tree, polys in zip(pending, all_polys):
-            # 折り線を共有する面対は展開図でも線の反対側に並ぶので重ならない
-            # （交差面積は浮動ノイズのみ）。交差計算を省く（実測で半分以上）。
-            folded_pairs = {(min(u, v), max(u, v)) for u, v in tree}
-            if not is_valid_layout(polys, folded_pairs):
+        # 重なり判定も窓単位でベクトル化する（外接矩形の絞り込みだけ）。
+        # 交差計算は 1 本ずつ逐次に early-exit するので、結果は
+        # is_valid_layout を順に呼んだ場合とビット単位で同じ。
+        ok_flags = _valid_batch(
+            all_polys, bnds, np.asarray(pending, dtype=np.intp)
+        )
+        for tree, polys, ok in zip(pending, all_polys, ok_flags):
+            if not ok:
                 continue
             yield tree, polys
