@@ -1,7 +1,8 @@
-"""`_batch_canonical_keys` の部位別コスト（CPU 時間、全窓合計）。
+"""`_batch_canonical_keys` の部位別コスト（現行コード、全窓合計）。
 
-`_batch_stabilize` の外側（位置引き・接着・個別化・キー tuple 化）が
-署名フェーズの約 1/4 を占めるので、その内訳を見る。
+`_batch_stabilize` の外側（位置引き・接着・個別化・キー化）が署名フェーズの
+どれだけを占めるかを見る。壁時計だが同一プロセス内の back-to-back 計測なので
+比は読める（`time.process_time` は Windows では刻み 15.6ms で部位ごとには粗い）。
 
     uv run python tools/probe_keys_parts.py stairs
 """
@@ -18,7 +19,7 @@ import numpy as np
 import fifth
 from bench_ladder import SOLIDS
 
-_PARTS = ("asarray", "positions", "glue", "stabilize", "individualize", "keysort", "tuples")
+_PARTS = ("asarray", "positions", "glue", "stabilize", "individualize", "keysort", "keyslice")
 
 
 def main() -> None:
@@ -33,7 +34,7 @@ def main() -> None:
     clocks = dict.fromkeys(_PARTS, 0.0)
     n_indiv = 0
     n_rows = 0
-    t_all = time.process_time()
+    t_all = time.perf_counter()
 
     rest = iter(trees)
     while True:
@@ -41,46 +42,49 @@ def main() -> None:
         if not window:
             break
         n = len(window)
-        t0 = time.process_time()
+        t0 = time.perf_counter()
         edges_arr = np.asarray(window, dtype=np.int64)
-        t1 = time.process_time()
-        clocks["asarray"] += t1 - t0
+        t = time.perf_counter()
+        clocks["asarray"] += t - t0
         for context in (ctx, mirror_ctx):
             positions = context.adj_pos_matrix[edges_arr[:, :, 0], edges_arr[:, :, 1]]
-            t2 = time.process_time()
-            clocks["positions"] += t2 - t1
+            t2 = time.perf_counter()
+            clocks["positions"] += t2 - t
             partner, flip = fifth._glue_batch(context, positions)
-            t3 = time.process_time()
+            t3 = time.perf_counter()
             clocks["glue"] += t3 - t2
             colors, counts = fifth._batch_stabilize(context, partner, flip)
-            t4 = time.process_time()
+            t4 = time.perf_counter()
             clocks["stabilize"] += t4 - t3
             n_nodes = context.n_nodes
             nxt_list = context.nxt
             for idx in np.flatnonzero(counts != n_nodes).tolist():
                 n_indiv += 1
-                fifth._individualize_refine(
-                    nxt_list,
-                    partner[idx].tolist(),
-                    flip[idx].tolist(),
-                    colors[idx].tolist(),
-                    [0],
+                fifth._key_bytes(
+                    fifth._individualize_refine(
+                        nxt_list,
+                        partner[idx].tolist(),
+                        flip[idx].tolist(),
+                        colors[idx].tolist(),
+                        [0],
+                    )
                 )
-            t5 = time.process_time()
+            t5 = time.perf_counter()
             clocks["individualize"] += t5 - t4
             rows = np.flatnonzero(counts == n_nodes)
-            sorted_colors = np.sort(colors, axis=1).tolist()
-            t6 = time.process_time()
+            flat = np.sort(colors, axis=1).astype(">u8").tobytes()
+            stride = n_nodes * 8
+            t6 = time.perf_counter()
             clocks["keysort"] += t6 - t5
             for idx in rows.tolist():
-                tuple(sorted_colors[idx])
-            t7 = time.process_time()
-            clocks["tuples"] += t7 - t6
+                flat[idx * stride : (idx + 1) * stride]
+            t7 = time.perf_counter()
+            clocks["keyslice"] += t7 - t6
             n_rows += len(rows)
-            t1 = t7
+            t = t7
 
-    total = time.process_time() - t_all
-    print(f"{name}: total_cpu={total:.3f}s rows={n_rows} individualized={n_indiv}")
+    total = time.perf_counter() - t_all
+    print(f"{name}: total={total:.3f}s rows={n_rows} individualized={n_indiv}")
     for k in _PARTS:
         print(f"  {k:14s} {clocks[k]:8.4f}s  {100 * clocks[k] / total:5.1f}%")
 

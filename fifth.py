@@ -1651,10 +1651,21 @@ def _batch_stabilize(
             counts = _distinct_counts(nh)
             continue
         assert counts is not None
-        new_counts = _distinct_counts(nh)
+        # 全色が別に達した行（色数 == n_nodes）はもう細分できないので、色数を
+        # 数えなくとも次のラウンドで done が確定する（色数は n_nodes のまま）。
+        # その行を除いて数えると `_distinct_counts` の並べ替えが減る
+        # （実測 stairs で row-round の 12.6%、lshape で 15.8% がこの行）。
+        # 色数の値も n_nodes のままなので counts をそのまま流用できる。
+        full = counts == n_nodes
+        done = full
+        new_counts = counts.copy()
+        part = ~full
+        if part.any():
+            part_counts = _distinct_counts(nh[part])
+            new_counts[part] = part_counts
+            done[part] = part_counts == counts[part]
         # 安定した行は値を確定して以降から外す。h / counts / row_ids は
         # 常に同じ長さで、keep で同時に縮める（片方だけ縮めると壊れる）。
-        done = new_counts == counts
         out_colors[row_ids[done]] = nh[done]
         out_counts[row_ids[done]] = new_counts[done]
         # ⚠️ 終了条件は **done.all()**。keep（= ~done）が全部 True なのは

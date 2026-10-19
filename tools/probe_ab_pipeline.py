@@ -93,23 +93,34 @@ def main() -> None:
     acc_new = instrument(fifth)
     acc_old = instrument(old)
 
-    best = {"new": float("inf"), "old": float("inf")}
-    stab = {"new": float("inf"), "old": float("inf")}
-    for _ in range(rounds):
-        for label, mod, acc in (("new", fifth, acc_new), ("old", old, acc_old)):
+    # ⚠️ 毎ラウンド同じ順で走らせると「先に走ったほうが有利/不利」という
+    # 系統誤差がそのまま比に出る（1 ラウンド 5 秒級なので負荷のドリフトも入る）。
+    # 奇数ラウンドで順序を入れ替え、**ペアごとの比の中央値**を取る。
+    pairs: list[tuple[float, float]] = []
+    for r in range(rounds):
+        order = [("new", fifth, acc_new), ("old", old, acc_old)]
+        if r % 2 == 1:
+            order.reverse()
+        dts: dict[str, float] = {}
+        for label, mod, acc in order:
             acc["stabilize"] = 0.0
             acc["calls"] = 0.0
             t0 = time.process_time()
             run(mod, v, faces, trees, normals)
-            dt = time.process_time() - t0
-            best[label] = min(best[label], dt)
-            stab[label] = min(stab[label], acc["stabilize"])
-            print(f"    {label}: {dt:7.3f}s   stabilize={acc['stabilize']:6.3f}s "
+            dts[label] = time.process_time() - t0
+            if label == "new":
+                dts["stab_new"] = acc["stabilize"]
+            else:
+                dts["stab_old"] = acc["stabilize"]
+            print(f"    {label}: {dts[label]:7.3f}s   stabilize={acc['stabilize']:6.3f}s "
                   f"({acc['calls']:.0f} calls)")
-    print(f"  total     new {best['new']:.3f}s   old {best['old']:.3f}s   "
-          f"ratio old/new = {best['old'] / best['new']:.3f}x")
-    print(f"  stabilize new {stab['new']:.3f}s   old {stab['old']:.3f}s   "
-          f"ratio old/new = {stab['old'] / stab['new']:.3f}x")
+        pairs.append((dts["new"], dts["old"]))
+    ratios = sorted(o / n for n, o in pairs)
+    med = ratios[len(ratios) // 2]
+    print(f"  total ratio old/new per round: "
+          f"{' '.join(f'{o / n:.3f}' for n, o in pairs)}  median={med:.3f}x")
+    print(f"  stabilize new {min(p[0] for p in pairs):.3f}s+   old "
+          f"{min(p[1] for p in pairs):.3f}s+")
 
 
 if __name__ == "__main__":
