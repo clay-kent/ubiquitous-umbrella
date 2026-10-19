@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SKIP = (".venv", ".git", "__pycache__", ".mypy_cache")
 
 # 「明らかに別言語」のスクリプト・記号の範囲だけを疑う。
+# ⚠️ ギリシャ文字（ρ, π, τ, Σ）は数式の記号として意図的に使うので**入れない**
+# （Cycle 30 で円板の半径 ρ・円周率 π を docstring とレポートで使っている）。
 SUSPICIOUS_RANGES = [
     (0x0400, 0x04FF, "キリル文字"),
     (0x0500, 0x052F, "キリル文字補助"),
@@ -22,13 +24,17 @@ SUSPICIOUS_RANGES = [
     (0x0590, 0x05FF, "ヘブライ文字"),
     (0x0600, 0x06FF, "アラビア文字"),
     (0x0700, 0x074F, "シリア文字"),
-    (0x0370, 0x03FF, "ギリシャ文字"),
     (0x0E00, 0x0E7F, "タイ文字"),
     (0xAC00, 0xD7AF, "ハングル"),
     (0x1100, 0x11FF, "ハングル字母"),
     (0x0100, 0x017F, "ラテン拡張A（ポルトガル語等）"),
     (0xFFFD, 0xFFFD, "置換文字(U+FFFD)"),
 ]
+
+# 意図的に残している既知の1文字（混入の記録そのもの）。
+KNOWN_OK = {
+    ("reports/v3-pr2.md", "접"),  # 「접 → 接」の修正記録
+}
 
 # 簡体字（中国語）専用の文字。日本語のかな・漢字も CJK 統合漢字なので
 # 範囲では区別できないため、混入しやすい簡体字を名指しで疑う。
@@ -66,7 +72,7 @@ def main() -> int:
         for lineno, line in enumerate(text.splitlines(), 1):
             for col, ch in enumerate(line, 1):
                 name = classify(ch)
-                if name:
+                if name and (path.relative_to(ROOT).as_posix(), ch) not in KNOWN_OK:
                     uname = unicodedata.name(ch, "?")
                     print(
                         f"{path.relative_to(ROOT)}:{lineno}:{col} "
