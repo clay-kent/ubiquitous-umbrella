@@ -59,13 +59,27 @@ def main() -> None:
         rows, cols = np.nonzero(cand)
         out = [True] * n_batch
         if cert is not None and rows.size:
-            proven = fifth._proven_overlaps(
-                rows, cols, pair_i, pair_j, thresh[rows, cols], cert
-            )
-            N["proven"] += int(proven.sum())
-            if proven.any():
-                bad = np.zeros(n_batch, dtype=bool)
-                bad[rows[proven]] = True
+            counts_all = np.bincount(rows, minlength=n_batch)
+            starts = np.zeros(n_batch, dtype=np.intp)
+            np.cumsum(counts_all[:-1], out=starts[1:])
+            bad = np.zeros(n_batch, dtype=bool)
+            alive = counts_all > 0
+            wave = 0
+            while True:
+                nets = np.nonzero(alive)[0]
+                if nets.size == 0:
+                    break
+                pos = starts[nets] + wave
+                hit = fifth._proven_overlaps(
+                    rows[pos], cols[pos], pair_i, pair_j, thresh[rows[pos], cols[pos]], cert
+                )
+                N["proven"] += int(hit.sum())
+                if hit.any():
+                    bad[nets[hit]] = True
+                alive[:] = False
+                alive[nets[(~hit) & (counts_all[nets] > wave + 1)]] = True
+                wave += 1
+            if bad.any():
                 out = (~bad).tolist()
                 keep = ~bad[rows]
                 rows = rows[keep]
@@ -73,7 +87,7 @@ def main() -> None:
         ACC["proof"] += time.perf_counter() - t
 
         t = time.perf_counter()
-        counts = np.bincount(rows, minlength=n_batch) if rows.size else np.zeros(0, dtype=int)
+        counts = np.bincount(rows, minlength=n_batch)
         col_list = cols.tolist()
         thr_list = thresh[rows, cols].tolist()
         ACC["extract"] += time.perf_counter() - t

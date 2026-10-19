@@ -1171,6 +1171,29 @@ def _placed_probes(
     return qx, qy
 
 
+def _prove_direction(
+    rows: npt.NDArray[np.intp],
+    probe_of: npt.NDArray[np.intp],
+    poly_of: npt.NDArray[np.intp],
+    cert: LayoutCert,
+    ks: slice,
+    thresh: npt.NDArray[np.float64],
+) -> npt.NDArray[np.bool_]:
+    """「面 probe_of の探針（``ks`` の範囲）が面 poly_of の内部に深く入る」を判定する。"""
+    fx = cert.flat_x
+    fy = cert.flat_y
+    pad = cert.padding
+    qx, qy = _placed_probes(fx, fy, rows, probe_of, cert)
+    return _probe_disk_hits(
+        qx[:, ks],
+        qy[:, ks],
+        cert.probe_r[probe_of][:, ks],
+        fx[rows[:, None], pad[poly_of]],
+        fy[rows[:, None], pad[poly_of]],
+        thresh,
+    )
+
+
 def _proven_overlaps(
     rows: npt.NDArray[np.intp],
     cols: npt.NDArray[np.intp],
@@ -1184,29 +1207,36 @@ def _proven_overlaps(
     面ごとに「内部に確実に入る円板」を前計算してあるので（:func:`_face_probes`）、
     剛体変換で配置したあとの中心と半径を使えばいい。両方向を試す。
 
+    探針は**1本目を先に**試す（1本で 62.9%、4本で 82.7% を証明できるので、
+    残り3本は証明できなかった行だけに使う。numpy の計算量がほぼ半分になる）。
+
     健全性: 証明できたペアは**本当に**面積 > 閾値なので、判定（重なりが1つでも
     あれば不正）は変わらない。証明できなかったペアは従来どおり
     ``Polygon.intersection`` で判定するので、呼び出し回数は増えない。
     """
+    n = rows.size
+    proven = np.zeros(n, dtype=bool)
+    if n == 0:
+        return proven
     pi = pair_i[cols]
     pj = pair_j[cols]
-    fx = cert.flat_x
-    fy = cert.flat_y
-    pad = cert.padding
-    qx, qy = _placed_probes(fx, fy, rows, pi, cert)
-    proven = _probe_disk_hits(
-        qx, qy, cert.probe_r[pi], fx[rows[:, None], pad[pj]], fy[rows[:, None], pad[pj]], thresh
-    )
-    if not proven.all():
-        rx, ry = _placed_probes(fx, fy, rows, pj, cert)
-        proven |= _probe_disk_hits(
-            rx,
-            ry,
-            cert.probe_r[pj],
-            fx[rows[:, None], pad[pi]],
-            fy[rows[:, None], pad[pi]],
-            thresh,
-        )
+    # (向きを反転するか, 探針の範囲)。安い1本目を両方向→残りを両方向。
+    passes: list[tuple[bool, slice]] = [(False, slice(0, 1)), (True, slice(0, 1))]
+    if cert.probe_r.shape[1] > 1:
+        passes.append((False, slice(1, None)))
+        passes.append((True, slice(1, None)))
+    todo = np.ones(n, dtype=bool)
+    for reverse, ks in passes:
+        idx = np.nonzero(todo)[0]
+        if idx.size == 0:
+            break
+        c = cols[idx]
+        if reverse:
+            probe_of, poly_of = pair_j[c], pair_i[c]
+        else:
+            probe_of, poly_of = pair_i[c], pair_j[c]
+        proven[idx] |= _prove_direction(rows[idx], probe_of, poly_of, cert, ks, thresh[idx])
+        todo[idx] = ~proven[idx]
     return proven
 
 
@@ -1270,10 +1300,31 @@ def _valid_batch(
     if rows.size == 0:
         return out
     if cert is not None:
-        proven = _proven_overlaps(rows, cols, pair_i, pair_j, thresh[rows, cols], cert)
-        if proven.any():
-            bad = np.zeros(n_batch, dtype=bool)
-            bad[rows[proven]] = True
+        # 候補を「ネットごとに1つずつ」波状に処理する。証明できたネットはその時点で
+        # 不正が確定するので打ち切り、残りは次の候補へ進む（判定は順序に依らない）。
+        # 全候補（stairs で 124,039 件）を一度に証明しようとすると、証明の numpy 計算
+        # そのものが `intersection` より重くなる（実測 0.67s）。ネットの平均候補数は
+        # 3.3 なので、波状にすると計算は約 1/2.3 で同じネットが証明できる。
+        counts_all = np.bincount(rows, minlength=n_batch)
+        starts = np.zeros(n_batch, dtype=np.intp)
+        np.cumsum(counts_all[:-1], out=starts[1:])
+        bad = np.zeros(n_batch, dtype=bool)
+        alive = counts_all > 0
+        wave = 0
+        while True:
+            nets = np.nonzero(alive)[0]
+            if nets.size == 0:
+                break
+            sel = starts[nets] + wave
+            hit = _proven_overlaps(
+                rows[sel], cols[sel], pair_i, pair_j, thresh[rows[sel], cols[sel]], cert
+            )
+            if hit.any():
+                bad[nets[hit]] = True
+            alive[:] = False
+            alive[nets[(~hit) & (counts_all[nets] > wave + 1)]] = True
+            wave += 1
+        if bad.any():
             out = (~bad).tolist()
             keep = ~bad[rows]
             rows = rows[keep]
