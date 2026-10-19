@@ -217,21 +217,38 @@ def build_adjacency_graph(faces: list[list[int]]) -> list[tuple[int, int]]:
     return [(u, v) for u, v, _ in build_adjacency_with_edges(faces)]
 
 
+def _is_connected_edges(cur: list[tuple[int, int, int]], num_nodes: int) -> bool:
+    """``(番号, a, b)`` の3つ組の列が全 num_nodes 頂点を連結にするかを調べる。
+
+    隣接リストを組んで BFS する代わりに、「到達した頂点のビットマスク」を辺の
+    走査で伸ばして不動点まで回す（Bellman-Ford 風）。列挙の再帰が渡す入力は
+    小さい（stairs で平均 4.8 辺）ので、vertex 数ぶんの list と set を確保する
+    ほうが高くつく。
+
+    実測（実際に呼ばれた入力 30,000 件を捕まえて交互計測した最小値）:
+    0.90us → **0.59us（1.5x）**。判定は 30,000 件すべて一致
+    （tools/probe_is_connected.py）。呼び出し側は元の辺番号付きの3つ組を
+    持っているので、``_is_connected`` と違いペアのリストを作り直さずに済む。
+    """
+    full = (1 << num_nodes) - 1
+    reach = 1
+    while True:
+        added = reach
+        for _i, a, b in cur:
+            if reach >> a & 1:
+                added |= 1 << b
+            elif reach >> b & 1:
+                added |= 1 << a
+        if added == reach:
+            return reach == full
+        reach = added
+        if reach == full:
+            return True
+
+
 def _is_connected(cur: list[tuple[int, int]], num_nodes: int) -> bool:
-    """辺集合が全 num_nodes 頂点を連結にするかを BFS で調べる。"""
-    nbrs: list[list[int]] = [[] for _ in range(num_nodes)]
-    for a, b in cur:
-        nbrs[a].append(b)
-        nbrs[b].append(a)
-    seen = {0}
-    stack = [0]
-    while stack:
-        c = stack.pop()
-        for w in nbrs[c]:
-            if w not in seen:
-                seen.add(w)
-                stack.append(w)
-    return len(seen) == num_nodes
+    """辺集合が全 num_nodes 頂点を連結にするかを調べる（``(a, b)`` の列）。"""
+    return _is_connected_edges([(0, a, b) for a, b in cur], num_nodes)
 
 
 def enumerate_spanning_trees(
@@ -258,7 +275,7 @@ def enumerate_spanning_trees(
     # (元の辺番号, u, v) の組で持つ。縮約しても元の番号を失わないため。
     base = [(i, u, v) for i, (u, v) in enumerate(edges) if u != v]
     endpoints = {i: (u, v) for i, u, v in base}
-    if not _is_connected([(u, v) for _, u, v in base], num_nodes):
+    if not _is_connected_edges(base, num_nodes):
         return
 
     def rec(
@@ -283,7 +300,7 @@ def enumerate_spanning_trees(
         rest = cur[:pivot] + cur[pivot + 1:]
 
         # (1) pivot を使わない全域木
-        if _is_connected([(a, b) for _, a, b in rest], n):
+        if _is_connected_edges(rest, n):
             yield from rec(rest, n, chosen)
 
         # (2) pivot を使う全域木：pivot の両端を縮約して、縮約後の全域木に対応させる

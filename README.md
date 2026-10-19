@@ -249,6 +249,11 @@ L 字柱（1516 種）と 6 角柱（354 種）は全域木が 8,100 本あり�
 | `tools/probe_batched_intersection.py` | 交差計算の完全バッチ化（判定は一致するが 1.8x 遅い。不採用の根拠） |
 | `tools/probe_candidate_order.py` | 候補ペアの走査順を変えても交差回数が減らないことの確認 |
 | `tools/probe_wl_collisions.py` | 線形色ハッシュが早期ラウンドで衝突する行数の実測（Cycle 21 の根拠） |
+| `tools/probe_ab_enum.py` | 列挙そのものの新旧 A/B（パイプラインの A/B は木を先に作るので列挙が見えない） |
+| `tools/probe_is_connected.py` | 連結判定の速い実装を**実際に呼ばれた入力**で比較（同入力・全件一致を確認） |
+| `tools/probe_enum_parts.py` | 列挙の内訳（連結判定の回数と時間） |
+| `tools/probe_asarray.py` | 窓の木→配列の経路比較（`np.fromiter` が 3.0x） |
+| `tools/check_u64_ring.py` | uint64（mod 2^64）の結合法則・分配法則の確認 |
 | `tools/check_small_dot_bits.py` | 小さい内積/行列ベクトルがスカラ式とビット一致するかの確認 |
 | `tools/check_projection_bits.py` | 投影のバッチ化がビット一致するかの確認（しない） |
 | `tools/check_projection_axes_bits.py` | 軸/定数項だけのバッチが**ビット一致**するかの確認（する） |

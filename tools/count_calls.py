@@ -19,13 +19,13 @@ def main():
         edges = fifth.build_adjacency_graph(faces)
         n_trees = fifth.count_spanning_trees(edges, len(faces))
         calls = {"n": 0}
-        orig = fifth._is_connected
+        orig = fifth._is_connected_edges
 
         def counting(cur, nn, _o=orig):
             calls["n"] += 1
             return _o(cur, nn)
 
-        fifth._is_connected = counting
+        fifth._is_connected_edges = counting
         try:
             emitted = sum(
                 1
@@ -34,7 +34,7 @@ def main():
                 )
             )
         finally:
-            fifth._is_connected = orig
+            fifth._is_connected_edges = orig
         per_tree = calls["n"] / max(emitted, 1)
         print(
             f"{name:8s} faces={len(faces):2d} total_trees={n_trees:9,d} "

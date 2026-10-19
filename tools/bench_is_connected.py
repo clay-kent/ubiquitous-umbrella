@@ -1,16 +1,27 @@
-"""_is_connected の2実装（list版 / bitmask版）を直接叩いて速度を比較する。
+"""連結判定の実装を、**大きいグラフ**（面数10・辺数10〜30）で比べる。
 
-プロセス全体の計測は外部ロード（実測で ±5 倍）を受けるため、
-対象関数だけを孤立させて測る。判定結果は真偽値だけで、丸め演算に無関係。
+ここで分かるのは「立体まるごとの面隣接グラフのような大きい入力では、
+頂点ごとの隣接ビットマスク + 前線ビットの BFS（frontier）は
+隣接リスト + set の BFS（list）に負ける」こと。
+
+⚠️ これだけを見て「ビットマスクは遅い」と結論してはいけない。列挙の再帰が
+渡す入力は小さい（stairs で平均 4.8 辺）ので、**実際に呼ばれた入力**で測ると
+逆転する。そちらは tools/probe_is_connected.py（30,000 件、全件一致、
+同入力での比較）と tools/probe_ab_enum.py（列挙そのものの新旧 A/B）が本命で、
+現行の `_is_connected_edges`（到達ビットマスクを辺の走査で伸ばす版）は
+そちらで採用した。
+
+    uv run python tools/bench_is_connected.py
 """
 
 import random
-import statistics
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import fifth
 
 
 def is_connected_list(cur, num_nodes):
@@ -29,7 +40,7 @@ def is_connected_list(cur, num_nodes):
     return len(seen) == num_nodes
 
 
-def is_connected_mask(cur, num_nodes):
+def is_connected_frontier(cur, num_nodes):
     nbrs = [0] * num_nodes
     for a, b in cur:
         nbrs[a] |= 1 << b
@@ -50,7 +61,6 @@ def is_connected_mask(cur, num_nodes):
 
 def main():
     rng = random.Random(20261017)
-    # 面数 10 / 辺数 18 程度（stairs 相当）で、連結なグラフを生成
     n = 10
     cases = []
     for _ in range(2000):
@@ -58,29 +68,26 @@ def main():
         edges = [(rng.randrange(n), rng.randrange(n)) for _ in range(m)]
         cases.append((edges, n))
 
-    # 結果が一致することを先に確認
     for edges, nn in cases[:200]:
-        assert is_connected_list(edges, nn) == is_connected_mask(edges, nn)
+        assert is_connected_list(edges, nn) == is_connected_frontier(edges, nn)
+        assert fifth._is_connected(edges, nn) == is_connected_list(edges, nn)
 
-    reps = 5
-    t_list, t_mask = [], []
-    for _ in range(reps):
-        t0 = time.perf_counter()
-        for edges, nn in cases:
-            is_connected_list(edges, nn)
-        t_list.append(time.perf_counter() - t0)
+    impls = {"list": is_connected_list, "frontier": is_connected_frontier,
+             "current": fifth._is_connected}
+    best = dict.fromkeys(impls, float("inf"))
+    for _ in range(5):
+        for k, fn in impls.items():
+            t0 = time.perf_counter()
+            for edges, nn in cases:
+                fn(edges, nn)
+            best[k] = min(best[k], time.perf_counter() - t0)
 
-        t0 = time.perf_counter()
-        for edges, nn in cases:
-            is_connected_mask(edges, nn)
-        t_mask.append(time.perf_counter() - t0)
-
-    ml = statistics.median(t_list)
-    mm = statistics.median(t_mask)
-    print(f"cases={len(cases)} reps={reps}")
-    print(f"  list version : {ml * 1000:8.2f} ms  ({ml / len(cases) * 1e6:.2f} us/call)")
-    print(f"  mask version : {mm * 1000:8.2f} ms  ({mm / len(cases) * 1e6:.2f} us/call)")
-    print(f"  speedup      : {ml / mm:.2f}x")
+    print(f"cases={len(cases)} (n={n}, m={n}..{3 * n}) reps=5, min")
+    for k in impls:
+        ms = best[k] * 1000
+        print(f"  {k:9s} {ms:8.2f} ms  ({best[k] / len(cases) * 1e6:5.2f} us/call)")
+    print(f"  比 list/current = {best['list'] / best['current']:.2f}x  "
+          f"list/frontier = {best['list'] / best['frontier']:.2f}x")
 
 
 if __name__ == "__main__":

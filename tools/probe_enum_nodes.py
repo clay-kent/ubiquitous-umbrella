@@ -21,17 +21,17 @@ def main() -> None:
     edges = fifth.build_adjacency_graph(faces)
 
     stats = {"connected": 0, "nodes": 0}
-    original = fifth._is_connected
+    original = fifth._is_connected_edges
 
     def counted(cur, num_nodes):
         stats["connected"] += 1
         return original(cur, num_nodes)
 
-    fifth._is_connected = counted
+    fifth._is_connected_edges = counted
     try:
         trees = list(fifth.enumerate_spanning_trees(edges, len(faces)))
     finally:
-        fifth._is_connected = original
+        fifth._is_connected_edges = original
 
     n = len(trees)
     print(
