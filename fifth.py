@@ -1552,11 +1552,32 @@ def _batch_stabilize(
     return out_colors, out_counts
 
 
+def _key_bytes(colors: Iterable[Color]) -> bytes:
+    """個別化まで行った行の正規形キーを決定的なバイト列にする。
+
+    キーを bytes に統一するのは、窓内のキーを ``min(自身, 鏡像)`` で比べるため
+    （型が混ざると Python の ``min`` が TypeError を投げる）。
+
+    ⚠️ 全色が別の行（8 バイト/色の ``>u8`` 連結）とは**長さで区別できる**
+    （こちらは 9 バイト/色）。色数が n_nodes 未満の行なので、そもそも全色別の
+    行と同じキーにはなり得ない。**順序に意味は無い**（意味があるのは等しいか
+    どうかだけ）が、単射であることは要る。色は int（``hash()`` の結果は負もあり得る）
+    なので符号 1 バイト + 絶対値 8 バイトで書く。
+    """
+    out = bytearray()
+    for c in colors:
+        if c < 0:
+            out += b"\x01" + (-c).to_bytes(8, "big")
+        else:
+            out += b"\x00" + c.to_bytes(8, "big")
+    return bytes(out)
+
+
 def _batch_canonical_keys(
     ctx: RibbonContext,
     mirror_ctx: RibbonContext,
     trees: list[list[tuple[int, int]]],
-) -> list[tuple[tuple[Color, ...], tuple[Color, ...]]]:
+) -> list[tuple[Any, Any]]:
     """窓内の全木について (自身の正規形, 鏡像の正規形) を返す。
 
     項目の並びは ``trees`` の順。各行は plain WL の安定化までバッチで回し、
@@ -1564,13 +1585,16 @@ def _batch_canonical_keys(
     既存の :func:`_individualize_refine`（個別化-細分）に回す。予算超過の判定と
     ``SolidError`` の送出手続きはそちらと同一。
 
-    キーは ``(ソート済みの色)`` のタプル。木ごと版（_net_signature）と違い、
-    ハッシュ関数が違うので**キーの中身は一致しない**。一致するのは
-    「同型なら同じキーになる」「同じキーになる同型は同値」という性質で、
-    これは batch の挙動が木ごと版と同じであることから従う。
+    キーは行によらず bytes。全色が別の行は「ソート済みの色列をビッグエンディアンで
+    並べた 8 バイト/色の連結」、個別化に回った行は :func:`_key_bytes` による
+    9 バイト/色。木ごと版（_net_signature）と違い、ハッシュ関数が違うので
+    **キーの中身は一致しない**。一致するのは「同型なら同じキーになる」
+    「同じキーになる同型は同値」という性質で、これは batch の挙動が木ごと版と
+    同じであることから従う。2 種類のキーは長さが違うので互いに一致しない
+    （個別化行の色数は n_nodes 未満で、全色が別の行にはなれない）。
     """
     n = len(trees)
-    keys: list[tuple[Color, ...]] = [None] * (2 * n)  # type: ignore[list-item]
+    keys: list[Any] = [None] * (2 * n)
 
     # すべての木は F-1 本の辺を持つ（全域木の定義）。辺の (u, v) を
     # (n, F-1, 2) の配列に一括変換すれば、位置 p は adj_pos_matrix の
@@ -1591,21 +1615,31 @@ def _batch_canonical_keys(
         rows_need_individualization = np.flatnonzero(counts != n_nodes)
         for idx in rows_need_individualization.tolist():
             # 色細分が止まったセルから個別化する。
-            keys[offset + idx] = _individualize_refine(
-                nxt_list,
-                partner[idx].tolist(),
-                flip[idx].tolist(),
-                colors[idx].tolist(),
-                [0],
+            keys[offset + idx] = _key_bytes(
+                _individualize_refine(
+                    nxt_list,
+                    partner[idx].tolist(),
+                    flip[idx].tolist(),
+                    colors[idx].tolist(),
+                    [0],
+                )
             )
         # 全半辺が別色になった行 = 色列そのものが完全な同型判定になる。
         # ソートして並べた色列がそのまま正規形キー。行ごとの sorted() を
-        # 呼ばず、軸1の numpy ソートで一括してから tuple 化する。
+        # 呼ばず、軸1の numpy ソートで一括する。
+        #
+        # ⚠️ キーはタプルではなく**ビッグエンディアンのバイト列**にする。
+        # tuple にすると ``.tolist()`` で (2048, 48) ぶんの Python int を
+        # 作ることになり、この行が署名フェーズの1割を占めていた（実測 0.44s）。
+        # ビッグエンディアンならバイト列の辞書順は uint64 の数値順と一致し、
+        # 固定幅の連結はタプルの辞書順と一致するので、``min(自身, 鏡像)`` の
+        # 選び方まで tuple 版と**完全に同じ**（= 代表として選ばれる木が変わらない）。
         rows_distinct = np.flatnonzero(counts == n_nodes)
         if rows_distinct.size:
-            sorted_colors = np.sort(colors, axis=1).tolist()
+            flat = np.sort(colors, axis=1).astype(">u8").tobytes()
+            stride = n_nodes * 8
             for idx in rows_distinct.tolist():
-                keys[offset + idx] = tuple(sorted_colors[idx])
+                keys[offset + idx] = flat[idx * stride : (idx + 1) * stride]
     return list(zip(keys[:n], keys[n:]))
 
 
