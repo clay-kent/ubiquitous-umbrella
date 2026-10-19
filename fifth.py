@@ -2031,13 +2031,12 @@ def _batch_stabilize(
     t2_buf = np.empty((n_rows, n_nodes), dtype=np.uint64)
     nh_a = np.empty((n_rows, n_nodes), dtype=np.uint64)
     nh_b = np.empty((n_rows, n_nodes), dtype=np.uint64)
-    flat_buf = np.empty((n_rows, n_nodes), dtype=np.intp)
     use_a = True
     # 接着相手の色を引く添字。行ごとに変わるので 2 次元 gather
     # （take_along_axis は実測 260us）より、平坦化した 1 次元 gather
-    # （実測 52us）のほうが速い。行番号が変わる（= 行を間引く）たびに
-    # 行オフセットを掛け直すので、partner_or_self は h と同じく詰め替える。
+    # （実測 52us）のほうが速い。行を間引いたときだけ作り直す。
     row_off = np.arange(n_rows, dtype=np.intp)[:, None] * n_nodes
+    flat_partner = partner_or_self + row_off
 
     # 最初の _WL_MIN_ROUNDS ラウンドは色数を数えない。
     # 実測（tools/probe_stabilize_parts.py、stairs）では 7 ラウンド目までに
@@ -2073,9 +2072,10 @@ def _batch_stabilize(
         np.copyto(t, h[:, nxt])
         np.multiply(t, _WL_B, out=t)
         np.add(nh, t, out=nh)
-        np.add(partner_or_self, row_off[:n], out=flat_buf[:n])
-        np.copyto(t2, h.reshape(-1)[flat_buf[:n].reshape(-1)].reshape(n, n_nodes))
-        np.multiply(t2, partner_coef, out=t2)
+        # 接着相手の色は「行オフセットを足した平坦添字」で 1 次元 gather する
+        # （flat_partner は行を間引いたときだけ作り直す）。
+        np.copyto(t2, h.reshape(-1)[flat_partner[:n].reshape(-1)].reshape(n, n_nodes))
+        np.multiply(t2, partner_coef[:n], out=t2)
         np.add(nh, t2, out=nh)
         np.add(nh, tag, out=nh)
         if rnd <= _WL_MIN_ROUNDS:
@@ -2116,6 +2116,8 @@ def _batch_stabilize(
         tag = tag[keep]
         counts = new_counts[keep]
         row_ids = row_ids[keep]
+        # 平坦添字は行番号に依存するので、間引いたときだけ作り直す。
+        np.add(partner_or_self, row_off[: len(h)], out=flat_partner[: len(h)])
 
     return out_colors, out_counts
 
