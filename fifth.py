@@ -486,6 +486,8 @@ def prepare_layout(
     ux, uy, uz = u_x.tolist()
     u_y = np.array([ny_ * uz - nz_ * uy, nz_ * ux - nx_ * uz, nx_ * uy - ny_ * ux])
 
+    fold_of = _build_fold_tables(vertices, faces, normals)
+
     return {
         "shared_of": build_shared_of(faces),
         "origin": origin,
@@ -503,8 +505,29 @@ def prepare_layout(
         # 全面の頂点数が同じなら、まとめて Polygon を作れる
         # (面u, 面v) -> (折り曲げ回転行列 r, w = p_a - r @ p_a)。
         # r は共有辺と両面の法線だけで決まるので木に依存しない。
-        "fold_of": _build_fold_tables(vertices, faces, normals),
+        "fold_of": fold_of,
+        # 上と同じものを (u, v) の2次元配列にしたもの。窓単位のバッチ展開
+        # （_layout_batch）で (親, 子) から1回のファンシー索引で引くため。
+        "fold_r_tab": _fold_table(fold_of, len(faces), 0),
+        "fold_w_tab": _fold_table(fold_of, len(faces), 1),
     }
+
+
+def _fold_table(
+    fold_of: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]],
+    n_faces: int,
+    part: int,
+) -> np.ndarray:
+    """``fold_of`` を (面, 面, ...) の密な配列にする（隣接しない対は 0）。
+
+    ``part=0`` が回転行列 (F, F, 3, 3)、``part=1`` が並進 (F, F, 3)。
+    バッチ展開で ``tab[親, 子]`` と1回のファンシー索引で引くために使う。
+    """
+    sample = next(iter(fold_of.values()))[part]
+    table = np.zeros((n_faces, n_faces) + sample.shape)
+    for (u, v), rw in fold_of.items():
+        table[u, v] = rw[part]
+    return table
 
 
 def _tree_bfs(
@@ -551,6 +574,9 @@ def layout_parent_relation(
     return _tree_bfs(n_faces, tree_edges)[0]
 
 
+_EYE3 = np.eye(3)
+
+
 def layout_tree(
     vertices: np.ndarray,
     faces: list[list[int]],
@@ -582,7 +608,7 @@ def layout_tree(
     # 値そのものは list 版と同一で、丸め演算も変わらない。
     rot = np.empty((n_faces, 3, 3))
     off = np.empty((n_faces, 3))
-    rot[0] = np.eye(3)
+    rot[0] = _EYE3
     off[0] = 0.0
     placed = [False] * n_faces
     placed[0] = True
@@ -646,6 +672,107 @@ def layout_tree(
         shapely.polygons(shapely.linearrings(flat, indices=indices)),
     )
     return list(built)
+
+
+def _layout_batch(
+    n_faces: int,
+    trees: list[list[tuple[int, int]]],
+    precomputed: Layout,
+) -> list[list[Polygon]]:
+    """窓内の複数の木をまとめて展開する（:func:`layout_tree` と同じ結果）。
+
+    1 本ずつ ``layout_tree`` を呼ぶと、面数が 10 程度では**計算量ではなく
+    numpy 呼び出しの固定費**が支配的になる（3x3 行列積 1 回が約 1.1us、
+    1 本あたり 50 回超）。木の本数ぶんまとめて軸を 1 次元増やせば、
+    同じ演算を数十回の呼び出しに畳める。
+
+    ⚠️ ビット単位で同じ結果になることが条件。以下はすべて実測で確認済み
+    （``tools/check_layout_batch_bits.py``）:
+
+    - ``np.matmul((B,3,3), (B,3,3))`` は 1 本ずつの ``(3,3)@(3,3)`` と一致
+      （numpy は内側で 1 枚ずつ同じカーネルを呼ぶ）。
+    - 軸 ``u @ rot`` は ``np.matmul(u, rot)`` が per-tree の einsum と一致。
+    - ``(shift*u).sum(axis=2)`` は per-tree の ``sum(axis=1)`` と一致。
+    - 投影の成分ごとの積和は要素ごとの演算なので一致。
+    - ``linearrings`` は ring ごとに独立なので、座標を連結しても同じ ring になる。
+
+    ``trees`` の順に Polygon のリストを返す。
+    """
+    n_batch = len(trees)
+    if n_batch == 0:
+        return []
+    n_edges = n_faces - 1
+
+    par = np.empty((n_batch, n_edges), dtype=np.int64)
+    child = np.empty((n_batch, n_edges), dtype=np.int64)
+    for b, tree in enumerate(trees):
+        _parents, pairs = _tree_bfs(n_faces, tree)
+        if len(pairs) != n_edges:
+            # layout_tree と同じ例外・同じメッセージにする（全域木が不正）。
+            reached = {0}
+            reached.update(v for _u, v in pairs)
+            missing = next(i for i in range(n_faces) if i not in reached)
+            raise ValueError(f"面{missing} へ到達できませんでした（全域木が不正です）。")
+        par[b] = [u for u, _v in pairs]
+        child[b] = [v for _u, v in pairs]
+
+    # (親, 子) -> (r, w) は 1 回のファンシー索引で全部引ける。
+    rot_tab = precomputed["fold_r_tab"]
+    off_tab = precomputed["fold_w_tab"]
+    rr = rot_tab[par, child]  # (B, n_edges, 3, 3)
+    ww = off_tab[par, child]  # (B, n_edges, 3)
+
+    rot = np.empty((n_batch, n_faces, 3, 3))
+    off = np.empty((n_batch, n_faces, 3))
+    rot[:, 0] = _EYE3
+    off[:, 0] = 0.0
+    rows = np.arange(n_batch)
+
+    for k in range(n_edges):
+        u = par[:, k]
+        v = child[:, k]
+        ru = rot[rows, u]  # (B, 3, 3)
+        rot[rows, v] = np.matmul(ru, rr[:, k])
+        off[rows, v] = (
+            np.matmul(ru, ww[:, k, :, None])[:, :, 0] + off[rows, u]
+        )
+
+    u_x = precomputed["u_x"]
+    u_y = precomputed["u_y"]
+    origin = precomputed["origin"]
+
+    axes_x = np.matmul(u_x, rot)  # (B, F, 3)
+    axes_y = np.matmul(u_y, rot)
+    shift = off - origin
+    cs_x = (shift * u_x).sum(axis=2)  # (B, F)
+    cs_y = (shift * u_y).sum(axis=2)
+
+    idx_rows = precomputed["flat_indices"]
+    P = precomputed["flat_pts"]
+    AX = axes_x[:, idx_rows]  # (B, M, 3)
+    AY = axes_y[:, idx_rows]
+    xs = (
+        P[None, :, 0] * AX[:, :, 0]
+        + P[None, :, 1] * AX[:, :, 1]
+        + P[None, :, 2] * AX[:, :, 2]
+        + cs_x[:, idx_rows]
+    )
+    ys = (
+        P[None, :, 0] * AY[:, :, 0]
+        + P[None, :, 1] * AY[:, :, 1]
+        + P[None, :, 2] * AY[:, :, 2]
+        + cs_y[:, idx_rows]
+    )
+
+    # 全木の座標を 1 本に連結し、ring の対応だけ木ごとにずらす。
+    # ring の生成は ring ごとに独立なので、まとめても 1 本ずつと同じ形になる。
+    flat = np.column_stack([xs.ravel(), ys.ravel()])
+    ring_idx = (np.arange(n_batch)[:, None] * n_faces + idx_rows[None, :]).ravel()
+    rings = shapely.linearrings(flat, indices=ring_idx)
+    # 実行時は numpy の object array だが、添字で切って list にすれば同じ。
+    built = cast(list[Polygon], shapely.polygons(rings))
+
+    return [built[b * n_faces : (b + 1) * n_faces] for b in range(n_batch)]
 
 
 def is_valid_layout(
@@ -1482,14 +1609,25 @@ def iter_unique_nets(
         # 返り値は変わらない。
         key_pairs = _batch_canonical_keys(ctx, mirror_ctx, window)
 
+        # 窓内で一意な木を集めてから、展開をまとめて行う。
+        # 1 本ずつ layout_tree を呼ぶと numpy 呼び出しの固定費が支配的なので、
+        # 窓単位でベクトル化する（_layout_batch、結果はビット単位で同じ）。
+        # 重複判定は木の順序どおりに済ませてから展開するので、返り値の順序は
+        # 従来と完全に一致する（重複判定は展開結果に依存しない）。
+        pending: list[list[tuple[int, int]]] = []
         for tree, (sig, mirror_sig) in zip(window, key_pairs):
             # キーを先に登録してあるので、同型な木は展開せずに弾ける。
             key = min(sig, mirror_sig)
             if key in exact_seen:
                 continue
             exact_seen.add(key)
+            pending.append(tree)
 
-            polys = layout_tree(vertices, faces, normals, tree, layout_prep)
+        if not pending:
+            continue
+        all_polys = _layout_batch(len(faces), pending, layout_prep)
+
+        for tree, polys in zip(pending, all_polys):
             # 折り線を共有する面対は展開図でも線の反対側に並ぶので重ならない
             # （交差面積は浮動ノイズのみ）。交差計算を省く（実測で半分以上）。
             folded_pairs = {(min(u, v), max(u, v)) for u, v in tree}

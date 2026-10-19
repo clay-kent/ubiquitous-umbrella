@@ -42,22 +42,30 @@ def main():
         key_pairs = fifth._batch_canonical_keys(ctx, mctx, window)
         t_sig += time.perf_counter() - t0
 
+        pending = []
         for tree, (sig, mirror_sig) in zip(window, key_pairs):
             key = min(sig, mirror_sig)
             if key in seen:
                 continue
             seen.add(key)
-            n_unique += 1
-            t0 = time.perf_counter()
-            polys = fifth.layout_tree(v, faces, normals, tree, prep)
-            t_layout += time.perf_counter() - t0
-            t0 = time.perf_counter()
+            pending.append(tree)
+        n_unique += len(pending)
+        if not pending:
+            continue
+
+        # 本番（iter_unique_nets）と同じく窓単位でまとめて展開する。
+        t0 = time.perf_counter()
+        all_polys = fifth._layout_batch(len(faces), pending, prep)
+        t_layout += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        for tree, polys in zip(pending, all_polys):
             ok = fifth.is_valid_layout(
                 polys, {(min(u, w), max(u, w)) for u, w in tree}
             )
-            t_valid += time.perf_counter() - t0
             if ok:
                 n_valid += 1
+        t_valid += time.perf_counter() - t0
 
     print(f"{name}: trees={len(trees)} unique_keys={n_unique} valid={n_valid}")
     print(f"  enumerate           : {t_enum:8.3f}s")
