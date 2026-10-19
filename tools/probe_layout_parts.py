@@ -1,28 +1,24 @@
-"""`layout_tree` の内部を部位別に測る（CPU 時間、全一意ネット合計）。
+"""展開（`_layout_batch`）の内訳: 何本を展開し、`_tree_bfs` がどれだけ占めるか。
 
-- BFS（木の探索）
-- rot/off の伝播（3x3 行列積が辺数ぶん）
-- 軸 eizum + 平行移動定数
-- 投影（成分ごとの積和）
-- Polygon 生成
+`_tree_bfs` はモジュールグローバルとして呼ばれるので、差し替えて合計時間を
+測れる（ラッパの固定費は 1 呼び出し 1us 弱で、本数ぶんしか乗らない）。
 
     uv run python tools/probe_layout_parts.py stairs
 """
 
 import sys
 import time
-from itertools import islice
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import numpy as np
-import shapely
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))
 
 import fifth
 from bench_ladder import SOLIDS
 
-_PARTS = ("bfs", "propagate", "axes", "project", "polygons")
+ST = {"trees": 0, "bfs_time": 0.0, "bfs_calls": 0, "layout_time": 0.0,
+      "batches": 0, "batch_rows": 0}
 
 
 def main() -> None:
@@ -30,79 +26,43 @@ def main() -> None:
     v, f = SOLIDS[name]
     faces = fifth.orient_faces_outward(v, f)
     normals = fifth.compute_normals(v, faces)
-    ctx = fifth.RibbonContext(v, faces)
-    mirror_ctx = fifth.RibbonContext(v, [list(reversed(ff)) for ff in faces])
     edges = fifth.build_adjacency_graph(faces)
-    prep = fifth.prepare_layout(v, faces, normals)
-    trees = list(fifth.enumerate_spanning_trees(edges, len(faces)))
 
-    # 一意な木だけ集める（シグネチャで重複を落とす）
-    seen = set()
-    unique = []
-    rest = iter(trees)
-    while True:
-        window = list(islice(rest, fifth._LADDER_WINDOW))
-        if not window:
-            break
-        for tree, (a, b) in zip(window, fifth._batch_canonical_keys(ctx, mirror_ctx, window)):
-            k = min(a, b)
-            if k in seen:
-                continue
-            seen.add(k)
-            unique.append(tree)
+    real_bfs = fifth._tree_bfs
+    real_batch = fifth._layout_batch
 
-    fold_of = prep["fold_of"]
-    n_faces = len(faces)
-    origin = prep["origin"]
-    u_x = prep["u_x"]
-    u_y = prep["u_y"]
-    idx_rows = prep["flat_indices"]
-    P = prep["flat_pts"]
+    def bfs(n_faces, tree_edges):  # type: ignore[no-untyped-def]
+        t0 = time.perf_counter()
+        r = real_bfs(n_faces, tree_edges)
+        ST["bfs_time"] += time.perf_counter() - t0
+        ST["bfs_calls"] += 1
+        return r
 
-    clocks = dict.fromkeys(_PARTS, 0.0)
-    t_all = time.process_time()
-    for tree in unique:
-        t0 = time.process_time()
-        _parents, pairs = fifth._tree_bfs(n_faces, tree)
-        t1 = time.process_time()
-        clocks["bfs"] += t1 - t0
+    def batch(n_faces, trees, precomputed):  # type: ignore[no-untyped-def]
+        ST["batches"] += 1
+        ST["batch_rows"] += len(trees)
+        t0 = time.perf_counter()
+        r = real_batch(n_faces, trees, precomputed)
+        ST["layout_time"] += time.perf_counter() - t0
+        return r
 
-        rot = np.empty((n_faces, 3, 3))
-        off = np.empty((n_faces, 3))
-        rot[0] = np.eye(3)
-        off[0] = 0.0
-        for u, vv in pairs:
-            r, w = fold_of[(u, vv)]
-            rot[vv] = rot[u] @ r
-            off[vv] = rot[u] @ w + off[u]
-        t2 = time.process_time()
-        clocks["propagate"] += t2 - t1
+    fifth._tree_bfs = bfs
+    fifth._layout_batch = batch
+    n = 0
+    t0 = time.perf_counter()
+    for _t, _p in fifth.iter_unique_nets(v, faces, fifth.enumerate_spanning_trees(edges, len(faces)), normals):
+        n += 1
+    total = time.perf_counter() - t0
+    fifth._tree_bfs = real_bfs
+    fifth._layout_batch = real_batch
 
-        axes_x = np.einsum("b,fba->fa", u_x, rot)
-        axes_y = np.einsum("b,fba->fa", u_y, rot)
-        shift = off - origin
-        cs_x = (shift * u_x).sum(axis=1)
-        cs_y = (shift * u_y).sum(axis=1)
-        t3 = time.process_time()
-        clocks["axes"] += t3 - t2
-
-        AX = axes_x[idx_rows]
-        AY = axes_y[idx_rows]
-        xs = P[:, 0] * AX[:, 0] + P[:, 1] * AX[:, 1] + P[:, 2] * AX[:, 2] + cs_x[idx_rows]
-        ys = P[:, 0] * AY[:, 0] + P[:, 1] * AY[:, 1] + P[:, 2] * AY[:, 2] + cs_y[idx_rows]
-        flat = np.column_stack([xs, ys])
-        t4 = time.process_time()
-        clocks["project"] += t4 - t3
-
-        shapely.polygons(shapely.linearrings(flat, indices=idx_rows))
-        t5 = time.process_time()
-        clocks["polygons"] += t5 - t4
-
-    total = time.process_time() - t_all
-    print(f"{name}: unique={len(unique)} layouts total_cpu={total:.3f}s"
-          f"  ({1e6 * total / len(unique):.1f} us/net)")
-    for k in _PARTS:
-        print(f"  {k:10s} {clocks[k]:8.4f}s {100 * clocks[k] / total:5.1f}%")
+    print(f"{name}: nets={n} pipeline={total:.3f}s")
+    print(f"  _layout_batch calls={ST['batches']} rows={ST['batch_rows']} "
+          f"time={ST['layout_time']:.3f}s ({ST['layout_time'] / total * 100:.1f}%)")
+    print(f"  _tree_bfs calls={ST['bfs_calls']} time={ST['bfs_time']:.3f}s "
+          f"({ST['bfs_time'] / total * 100:.1f}% of pipeline, "
+          f"{ST['bfs_time'] / max(ST['batch_rows'], 1) * 1e6:.2f} us/tree)")
+    print(f"  残り（ベクトル展開 + GEOS）={ST['layout_time'] - ST['bfs_time']:.3f}s")
 
 
 if __name__ == "__main__":

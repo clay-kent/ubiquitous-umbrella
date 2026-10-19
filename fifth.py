@@ -580,6 +580,60 @@ def _tree_bfs(
                 queue.append(v)
     return parents, pairs
 
+def _trees_depth_order(
+    n_faces: int, trees: list[list[tuple[int, int]]]
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]] | None:
+    """窓内の各木を面0で根付きにし、(親, 子) の列を**深さ順**で返す。
+
+    戻り値は ``(par, child)``。どちらも ``(木数, F-1)`` で、同じ行の中では
+    親が子より先に現れる（列 ``k`` を処理した時点で親の回転が確定している）。
+
+    :func:`_tree_bfs` のバッチ版だが、**列の順序は幅優先の訪問順ではない**。
+    深さが同じ面の並びは木ごとに違ってよい。回転の伝播は
+    「親を先に処理する」ことだけを要求し、値は親の回転だけで決まるので、
+    列の順序を変えても :func:`_layout_batch` の出力はビット単位で同じ。
+
+    到達できない面がある木（= 全域木でない）が 1 本でもあれば ``None`` を返す。
+    呼び出し側は木ごとの :func:`_tree_bfs` にフォールバックする（例外の文言まで
+    従来どおりにするため）。
+
+    親の割り当ては木の中の根からの経路で一意に決まる（同じ面を2つの親が
+    同時に発見することは木では起こらない）ので、ベクトル化しても木ごと版と
+    同じ親子関係になる。
+    """
+    n = len(trees)
+    n_edges = n_faces - 1
+    edges = _trees_to_array(trees, n_edges)  # (n, n_edges, 2)
+    eu = edges[:, :, 0]
+    ev = edges[:, :, 1]
+
+    depth = np.full((n, n_faces), -1, dtype=np.int64)
+    par = np.full((n, n_faces), -1, dtype=np.int64)
+    depth[:, 0] = 0
+    for _ in range(n_edges):
+        du = np.take_along_axis(depth, eu, axis=1)
+        dv = np.take_along_axis(depth, ev, axis=1)
+        fwd = (du >= 0) & (dv < 0)
+        bwd = (dv >= 0) & (du < 0)
+        disc = fwd | bwd
+        if not disc.any():
+            break
+        rows, cols = np.nonzero(disc)
+        take_fwd = fwd[rows, cols]
+        src = np.where(take_fwd, eu[rows, cols], ev[rows, cols])
+        tgt = np.where(take_fwd, ev[rows, cols], eu[rows, cols])
+        depth[rows, tgt] = depth[rows, src] + 1
+        par[rows, tgt] = src
+    if (depth < 0).any():
+        return None
+
+    # 深さの昇順に並べれば親が子より先に来る。同じ深さの中の順序は
+    # 出力に影響しないので、安定ソートは要らない（既定のクイックソート）。
+    order = np.argsort(depth, axis=1)
+    child = order[:, 1:]
+    return np.take_along_axis(par, child, axis=1), child
+
+
 def layout_parent_relation(
     n_faces: int, tree_edges: list[tuple[int, int]]
 ) -> list[int | None]:
@@ -710,6 +764,9 @@ def _layout_batch(
       （numpy は内側で 1 枚ずつ同じカーネルを呼ぶ）。
     - 軸 ``u @ rot`` は ``np.matmul(u, rot)`` が per-tree の einsum と一致。
     - ``(shift*u).sum(axis=2)`` は per-tree の ``sum(axis=1)`` と一致。
+    - 親子の列（``_trees_depth_order``）は幅優先の訪問順とは違う並びになるが、
+      回転の伝播は「親が子より先」だけを要求し、値は親の回転だけで決まるので
+      同じ結果になる（``tools/check_layout_batch_bits.py``）。
     - 投影の成分ごとの積和は要素ごとの演算なので一致。
     - ``linearrings`` は ring ごとに独立なので、座標を連結しても同じ ring になる。
 
@@ -724,16 +781,21 @@ def _layout_batch(
 
     par = np.empty((n_batch, n_edges), dtype=np.int64)
     child = np.empty((n_batch, n_edges), dtype=np.int64)
-    for b, tree in enumerate(trees):
-        _parents, pairs = _tree_bfs(n_faces, tree)
-        if len(pairs) != n_edges:
-            # layout_tree と同じ例外・同じメッセージにする（全域木が不正）。
-            reached = {0}
-            reached.update(v for _u, v in pairs)
-            missing = next(i for i in range(n_faces) if i not in reached)
-            raise ValueError(f"面{missing} へ到達できませんでした（全域木が不正です）。")
-        par[b] = [u for u, _v in pairs]
-        child[b] = [v for _u, v in pairs]
+    ordered = _trees_depth_order(n_faces, trees)
+    if ordered is None:
+        # 全域木でない木が混ざっていた。木ごとの経路にフォールバックして、
+        # layout_tree と同じ例外・同じメッセージに揃える（通常はここへ来ない）。
+        for b, tree in enumerate(trees):
+            _parents, pairs = _tree_bfs(n_faces, tree)
+            if len(pairs) != n_edges:
+                reached = {0}
+                reached.update(v for _u, v in pairs)
+                missing = next(i for i in range(n_faces) if i not in reached)
+                raise ValueError(f"面{missing} へ到達できませんでした（全域木が不正です）。")
+            par[b] = [u for u, _v in pairs]
+            child[b] = [v for _u, v in pairs]
+    else:
+        par, child = ordered
 
     # (親, 子) -> (r, w) は 1 回のファンシー索引で全部引ける。
     rot_tab = precomputed["fold_r_tab"]
