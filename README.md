@@ -237,6 +237,18 @@ L 字柱（1516 種）と 6 角柱（354 種）は全域木が 8,100 本あり�
 | `tools/hash_metrics_rounded.py` | 全展開図の指標を**9桁丸めでハッシュ**（丸めが ULP 級に変わるときの観測差チェック） |
 | `tools/bench_signatures_cpu.py` | 署名フェーズを **CPU 時間**で測る（外部負荷に強い。壁時計が5倍振れるとき用） |
 | `tools/bench_pipeline_cpu.py` | 列挙＋一意化の**パイプライン全体**を CPU 時間で測る（A/B 用） |
+| `tools/probe_ab_pipeline.py` | **同一プロセス内で新旧を交互に走らせる A/B**（HEAD の `fifth.py` を別モジュールとして読む）。パイプライン全体と `_batch_stabilize` の累計を出す。**この環境で 5% 未満の差を判定できる唯一の方法** |
+| `tools/probe_ab_stabilize.py` | 同じ方式で `_batch_stabilize` 単体を比べる（16ms 未満の呼び出しは内側で繰り返す） |
+| `tools/probe_pipeline_phases.py` | 現行コードのフェーズ別内訳（列挙 / 署名 / 展開 / 重なり判定）を関数ラップで測る |
+| `tools/probe_keys_parts.py` | `_batch_canonical_keys` の部位別（配列化 / 位置 / 接着 / WL / 個別化 / キー化） |
+| `tools/probe_stabilize_now.py` | `_batch_stabilize` の部位別（初期化 / 更新 / 色数 / 間引き）と ns/row-round |
+| `tools/probe_valid_batch_parts.py` | `_valid_batch` の部位別（前置フィルタ / 取り出し / 交差計算）と交差回数 |
+| `tools/check_layout_batch_bits.py` | 窓単位のバッチ展開が `layout_tree` と**ビット一致**することの確認（204,633 本） |
+| `tools/probe_window_size.py` | 窓サイズの比較（2048 が最小。出力は完全に同一） |
+| `tools/probe_area_filter.py` | 「面積の総和 > 外接矩形」による事前棄却が何割弾けるか（3.7%。不採用の根拠） |
+| `tools/probe_batched_intersection.py` | 交差計算の完全バッチ化（判定は一致するが 1.8x 遅い。不採用の根拠） |
+| `tools/probe_candidate_order.py` | 候補ペアの走査順を変えても交差回数が減らないことの確認 |
+| `tools/probe_wl_collisions.py` | 線形色ハッシュが早期ラウンドで衝突する行数の実測（Cycle 21 の根拠） |
 | `tools/check_small_dot_bits.py` | 小さい内積/行列ベクトルがスカラ式とビット一致するかの確認 |
 | `tools/check_projection_bits.py` | 投影のバッチ化がビット一致するかの確認（しない） |
 | `tools/check_projection_axes_bits.py` | 軸/定数項だけのバッチが**ビット一致**するかの確認（する） |
