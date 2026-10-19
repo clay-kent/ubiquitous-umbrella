@@ -25,7 +25,7 @@ from probe_ab_pipeline import load_old_module
 
 
 def digest(res: object) -> str:
-    polys, bnds = res  # type: ignore[misc]
+    polys, bnds = res[0], res[1]  # type: ignore[index]
     # ⚠️ shapely.to_wkb は object 配列を返す（要素は bytes）。tobytes() では
     # ポインタが並ぶだけなので、要素ごとに wkb を繋ぐ。
     h = hashlib.sha256()

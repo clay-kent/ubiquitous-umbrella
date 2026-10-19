@@ -151,12 +151,13 @@ def main() -> None:
 
     # 写しが本番と一致することの確認（最初の窓だけ）。
     w0 = trees[: fifth._LADDER_WINDOW]
-    ref, ref_b = fifth._layout_batch(len(faces), w0, prep)
-    got, got_b = traced(len(faces), w0, prep)
+    ref = fifth._layout_batch(len(faces), w0, prep)
+    ref_polys, ref_b = ref[0], ref[1]
+    got, got_b = traced(len(faces), w0, prep)[:2]
     same_b = np.array_equal(ref_b, got_b)
     same_p = all(
         np.array_equal(shapely.to_wkb(a), shapely.to_wkb(b))
-        for a, b in zip(ref, got)
+        for a, b in zip(ref_polys, got)
     )
     if not (same_b and same_p):
         raise SystemExit(f"写しが本番と不一致 (bounds={same_b}, polys={same_p})")

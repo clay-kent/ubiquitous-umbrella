@@ -42,7 +42,7 @@ def main() -> None:
         # 全木（立体が小さいので高々 8,100 本）を 512 本ずつまとめて比べる
         for start in range(0, len(trees), 512):
             chunk = trees[start : start + 512]
-            batched, _bnds = fifth._layout_batch(len(faces), chunk, prep)
+            batched, _bnds = fifth._layout_batch(len(faces), chunk, prep)[:2]
             for tree, polys_b in zip(chunk, batched):
                 polys_a = fifth.layout_tree(v, faces, normals, tree, prep)
                 total += 1

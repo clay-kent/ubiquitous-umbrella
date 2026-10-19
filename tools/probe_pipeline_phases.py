@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import fifth
 from bench_ladder import SOLIDS
 
-TARGETS = ("_batch_canonical_keys", "_layout_batch", "_valid_batch")
+TARGETS = ("_context_keys", "_layout_batch", "_valid_batch")
 
 
 def main() -> None:

@@ -489,6 +489,95 @@ def _build_fold_tables(
     return fold_of
 
 
+# 重なり判定で GEOS を呼ばずに「面積 > 閾値」を証明するための探針。
+# 面ごとに「内部に確実に入る円板」を _PROBE_COUNT 個だけ前計算しておく。
+# 実測（stairs の実重なり 31,990 ペアで証明できた割合）:
+# 1個 62.9% / 3個 80.3% / 4個 82.7%（tools/probe_probe_rates.py）。
+_PROBE_COUNT = 4
+_PROBE_GRID = 28
+# 証明に使う半径は僅かに縮める（配置の浮動小数ぶんの余裕）。
+_PROBE_SAFETY = 1.0 - 1e-12
+
+
+def _face_probes(
+    pts3: npt.NDArray[np.float64],
+    count: int = _PROBE_COUNT,
+    grid: int = _PROBE_GRID,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """面の内部に確実に入る円板の中心と半径を返す。
+
+    戻り値は ``(ab, rad)``。``ab`` は面の先頭3頂点 ``(v0, v1, v2)`` を基準に
+    したアフィン係数 ``(k, 2)``（点 ``v0 + a*(v1-v0) + b*(v2-v0)``）、
+    ``rad`` はその点を中心とする円板の半径 ``(k,)``。
+
+    半径は「面の境界までの距離」を格子点で評価した値そのものなので、その
+    円板は面の内部に完全に含まれる（境界に接するだけ）。剛体変換（折り曲げ）
+    で面を配置しても半径と係数の意味は変わらないので、展開図の座標から
+    探針の位置を作れる（:func:`_layout_batch`）。
+
+    点は「境界から遠い順」に、離れすぎない範囲で散らして選ぶ。面の形が
+    細い場合でも半径 0 の点は選ばない（``dist > 0`` のみ）。
+    """
+    origin = pts3[0]
+    e1 = pts3[1] - origin
+    e1 = e1 / np.linalg.norm(e1)
+    normal = np.cross(pts3[1] - origin, pts3[2] - origin)
+    normal = normal / np.linalg.norm(normal)
+    e2 = np.cross(normal, e1)
+    rel = pts3 - origin
+    pts = np.column_stack([rel @ e1, rel @ e2])  # (m, 2)
+
+    lo = pts.min(axis=0)
+    hi = pts.max(axis=0)
+    span = hi - lo
+    gx, gy = np.meshgrid(
+        np.linspace(lo[0], hi[0], grid), np.linspace(lo[1], hi[1], grid)
+    )
+    flat = np.column_stack([gx.ravel(), gy.ravel()])  # (G, 2)
+    px = flat[:, 0:1]
+    py = flat[:, 1:2]
+    ax = pts[:, 0][None, :]
+    ay = pts[:, 1][None, :]
+    bx = np.roll(pts[:, 0], -1)[None, :]
+    by = np.roll(pts[:, 1], -1)[None, :]
+    # 偶数奇数則で内外（境界から離れた点だけを使うので縮退しない）
+    cond = (ay > py) != (by > py)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cross_x = ax + (py - ay) * (bx - ax) / (by - ay)
+    inside = (cond & (px < cross_x)).sum(axis=1) % 2 == 1
+    # 境界（各辺の線分）までの距離
+    ex = bx - ax
+    ey = by - ay
+    ee = ex * ex + ey * ey
+    deg = ee <= 0.0
+    safe = np.where(deg, 1.0, ee)
+    t = np.clip(((px - ax) * ex + (py - ay) * ey) / safe, 0.0, 1.0)
+    t = np.where(deg, 0.0, t)
+    dist = np.sqrt((px - (ax + t * ex)) ** 2 + (py - (ay + t * ey)) ** 2).min(axis=1)
+
+    ok = inside & (dist > 0.0)
+    cand = flat[ok]
+    clear = dist[ok]
+    if len(cand) == 0:
+        return np.zeros((0, 2)), np.zeros(0)
+    sep = float(np.hypot(span[0], span[1])) / (3.0 * count)
+    sep2 = sep * sep
+    chosen: list[int] = []
+    for idx in np.argsort(-clear, kind="stable").tolist():
+        if len(chosen) >= count:
+            break
+        cx_, cy_ = cand[idx]
+        if all(
+            (cx_ - cand[j, 0]) ** 2 + (cy_ - cand[j, 1]) ** 2 >= sep2 for j in chosen
+        ):
+            chosen.append(idx)
+    sel = cand[chosen]
+    rad = clear[chosen]
+    mat = np.column_stack([pts[1] - pts[0], pts[2] - pts[0]])
+    ab = np.linalg.solve(mat, (sel - pts[0]).T).T
+    return ab, rad
+
+
 def prepare_layout(
     vertices: np.ndarray, faces: list[list[int]], normals: list[np.ndarray]
 ) -> Layout:
@@ -505,6 +594,28 @@ def prepare_layout(
 
     fold_of = _build_fold_tables(vertices, faces, normals)
 
+    # 面ごとの探針（内部に確実に入る円板）。重なり判定で GEOS を呼ばずに
+    # 「面積 > 閾値」を証明するのに使う（:func:`_proven_overlaps`）。
+    n_faces = len(faces)
+    lens = [len(f) for f in faces]
+    max_len = max(lens)
+    probe_ab = np.zeros((n_faces, _PROBE_COUNT, 2))
+    probe_r = np.zeros((n_faces, _PROBE_COUNT))
+    probe_anchor = np.zeros((n_faces, 3), dtype=np.intp)
+    flat_pad = np.zeros((n_faces, max_len), dtype=np.intp)
+    off = 0
+    for fi, f in enumerate(faces):
+        ab, rad = _face_probes(vertices[f])
+        probe_ab[fi, : rad.size] = ab
+        probe_r[fi, : rad.size] = rad
+        # 投影は 3D 点についてアフィンなので、先頭3頂点の像から探針の像が出る。
+        probe_anchor[fi] = (off, off + 1, off + 2)
+        flat_pad[fi, : lens[fi]] = np.arange(off, off + lens[fi])
+        # 余りは先頭頂点で埋める。縮退辺なので内外判定の交点は作らず、
+        # 距離は「実際の辺までの距離」以上にしかならない（証明は保守側）。
+        flat_pad[fi, lens[fi] :] = off
+        off += lens[fi]
+
     return {
         "shared_of": build_shared_of(faces),
         "origin": origin,
@@ -519,6 +630,11 @@ def prepare_layout(
         ),
         # 全 face の 3D 座標を1本に連結したもの（投影のバッチ計算用）。
         "flat_pts": np.concatenate([vertices[f] for f in faces]),
+        # 面ごとの探針（(a, b) 係数と半径）と、配置用の添字。
+        "probe_ab": probe_ab,
+        "probe_r": probe_r,
+        "probe_anchor": probe_anchor,
+        "flat_pad": flat_pad,
         # 全面の頂点数が同じなら、まとめて Polygon を作れる
         # (面u, 面v) -> (折り曲げ回転行列 r, w = p_a - r @ p_a)。
         # r は共有辺と両面の法線だけで決まるので木に依存しない。
@@ -745,11 +861,31 @@ def layout_tree(
     return list(built)
 
 
+class LayoutCert(NamedTuple):
+    """窓単位で「重なりを GEOS 無しで証明する」ための座標（:func:`_proven_overlaps`）。
+
+    ``_layout_batch`` が既に持っている頂点座標 ``flat_x/flat_y`` をそのまま渡し、
+    面ごとの探針は**候補ペアの分だけ** :func:`_proven_overlaps` で作る
+    （全 (窓, 面) について先に作ると、展開の 1 割ほど余計にかかる）。
+
+    ``padding`` は各面の頂点の添字（頂点数が面ごとに違うので最大頂点数まで
+    先頭頂点で埋めたもの）、``anchor`` は探針のアフィン基準（各面の先頭3頂点）、
+    ``probe_ab``/``probe_r`` は探針の係数と半径（:func:`_face_probes`）。
+    """
+
+    flat_x: npt.NDArray[np.float64]
+    flat_y: npt.NDArray[np.float64]
+    padding: npt.NDArray[np.intp]
+    anchor: npt.NDArray[np.intp]
+    probe_ab: npt.NDArray[np.float64]
+    probe_r: npt.NDArray[np.float64]
+
+
 def _layout_batch(
     n_faces: int,
     trees: list[list[tuple[int, int]]],
     precomputed: Layout,
-) -> tuple[list[Any], npt.NDArray[np.float64]]:
+) -> tuple[list[Any], npt.NDArray[np.float64], LayoutCert]:
     """窓内の複数の木をまとめて展開する（:func:`layout_tree` と同じ結果）。
 
     1 本ずつ ``layout_tree`` を呼ぶと、面数が 10 程度では**計算量ではなく
@@ -771,12 +907,20 @@ def _layout_batch(
     - ``linearrings`` は ring ごとに独立なので、座標を連結しても同じ ring になる。
 
     ``trees`` の順に Polygon のリストを返す。あわせて各ポリゴンの外接矩形
-    （``(B, F, 4)`` の ``[minx, miny, maxx, maxy]``）を返す
-    （:func:`_valid_batch` の事前絞り込み用）。
+    （``(B, F, 4)`` の ``[minx, miny, maxx, maxy]``）と、重なり判定の証明用の
+    探針座標（:class:`LayoutCert`）を返す（どちらも :func:`_valid_batch` 用）。
     """
     n_batch = len(trees)
     if n_batch == 0:
-        return [], np.empty((0, n_faces, 4), dtype=np.float64)
+        empty = np.empty((0, n_faces, 4), dtype=np.float64)
+        return [], empty, LayoutCert(
+            np.empty((0, 0)),
+            np.empty((0, 0)),
+            precomputed["flat_pad"],
+            precomputed["probe_anchor"],
+            precomputed["probe_ab"],
+            precomputed["probe_r"],
+        )
     n_edges = n_faces - 1
 
     par = np.empty((n_batch, n_edges), dtype=np.int64)
@@ -858,7 +1002,22 @@ def _layout_batch(
     # （1 本ずつ ``polygons[i].bounds`` を取ると呼び出し回数だけで 0.3 秒食う）。
     bnds = np.asarray(shapely.bounds(built), dtype=np.float64).reshape(n_batch, n_faces, 4)
 
-    return [built[b * n_faces : (b + 1) * n_faces] for b in range(n_batch)], bnds
+    # 重なり判定の証明用に、配置済みの頂点座標と前計算の表をそのまま渡す
+    # （探針の位置は :func:`_proven_overlaps` が候補ペアの分だけ作る）。
+    cert = LayoutCert(
+        xs,
+        ys,
+        precomputed["flat_pad"],
+        precomputed["probe_anchor"],
+        precomputed["probe_ab"],
+        precomputed["probe_r"],
+    )
+
+    return (
+        [built[b * n_faces : (b + 1) * n_faces] for b in range(n_batch)],
+        bnds,
+        cert,
+    )
 
 
 def is_valid_layout(
@@ -938,10 +1097,124 @@ def pair_table(n_faces: int) -> tuple[list[tuple[int, int]], npt.NDArray[np.intp
     return pairs, idx
 
 
+def _probe_disk_hits(
+    qx: npt.NDArray[np.float64],
+    qy: npt.NDArray[np.float64],
+    rad: npt.NDArray[np.float64],
+    wx: npt.NDArray[np.float64],
+    wy: npt.NDArray[np.float64],
+    thresh: npt.NDArray[np.float64],
+) -> npt.NDArray[np.bool_]:
+    """探針の円板が多角形の内部に完全に入るかを判定する（GEOS を呼ばない）。
+
+    ``(qx, qy, rad)`` は探針（``(n, K)``）、``(wx, wy)`` は相手の多角形の頂点
+    （``(n, M)``、余りは先頭頂点で埋めてある）。返り値は ``(n,)`` で、
+    「交差面積 > thresh」を証明できた候補が ``True``。
+
+    証明の形: 探針の中心 ``p`` が相手の内部にあり、相手の境界までの距離 ``d``
+    と自分の半径 ``r`` の小さいほうを ``ρ`` とすると、半径 ``ρ`` の円板は
+    両方の内部に完全に入る。よって ``area(交差) >= π ρ²``。``π ρ² > thresh``
+    なら ``area(交差) > thresh`` が証明できる。
+
+    ``p`` が内部にあるかは偶数奇数則で見る。``ρ`` が正である限り境界から
+    離れているので、レイが頂点を通る等の縮退は起きない（起きた場合は
+    交点の数え方が 0/2 の対で変わるだけで偶奇は保たれる）。
+    """
+    ex = np.roll(wx, -1, axis=1)[:, None, :] - wx[:, None, :]
+    ey = np.roll(wy, -1, axis=1)[:, None, :] - wy[:, None, :]
+    rx = qx[:, :, None] - wx[:, None, :]
+    ry = qy[:, :, None] - wy[:, None, :]
+    ee = ex * ex + ey * ey
+    # 埋め草の縮退辺（長さ 0）は「先頭頂点までの距離」になる。先頭頂点も
+    # 境界上の点なので、距離は実際の境界までの距離以上（証明は保守側）。
+    deg = ee <= 0.0
+    t = np.clip((rx * ex + ry * ey) / np.where(deg, 1.0, ee), 0.0, 1.0)
+    t = np.where(deg, 0.0, t)
+    dist = np.sqrt((rx - t * ex) ** 2 + (ry - t * ey) ** 2).min(axis=2)
+    # 偶数奇数則（+x 方向のレイが辺を横切る回数）
+    y0 = wy[:, None, :]
+    y1 = np.roll(wy, -1, axis=1)[:, None, :]
+    x0 = wx[:, None, :]
+    x1 = np.roll(wx, -1, axis=1)[:, None, :]
+    qy3 = qy[:, :, None]
+    cond = (y0 > qy3) != (y1 > qy3)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xc = x0 + (qy3 - y0) * (x1 - x0) / (y1 - y0)
+    inside = ((cond & (qx[:, :, None] < xc)).sum(axis=2) % 2) == 1
+    rho = np.minimum(rad, dist) * _PROBE_SAFETY
+    hit = inside & (rho * rho * np.pi > thresh[:, None])
+    return np.asarray(hit.any(axis=1))
+
+
+def _placed_probes(
+    fx: npt.NDArray[np.float64],
+    fy: npt.NDArray[np.float64],
+    rows: npt.NDArray[np.intp],
+    faces: npt.NDArray[np.intp],
+    cert: LayoutCert,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """候補ペアの「探針の位置」を配置済み座標から作る（(n, K) を2本）。
+
+    投影は 3D 点についてアフィンなので、面の先頭3頂点の像とアフィン係数だけで
+    探針の像が出る（:func:`_face_probes`）。
+    """
+    anchor = cert.anchor[faces]  # (n, 3)
+    ab = cert.probe_ab[faces]  # (n, K, 2)
+    x0 = fx[rows, anchor[:, 0]][:, None]  # (n, 1)
+    x1 = fx[rows, anchor[:, 1]][:, None]
+    x2 = fx[rows, anchor[:, 2]][:, None]
+    y0 = fy[rows, anchor[:, 0]][:, None]
+    y1 = fy[rows, anchor[:, 1]][:, None]
+    y2 = fy[rows, anchor[:, 2]][:, None]
+    qx = x0 + ab[:, :, 0] * (x1 - x0) + ab[:, :, 1] * (x2 - x0)
+    qy = y0 + ab[:, :, 0] * (y1 - y0) + ab[:, :, 1] * (y2 - y0)
+    return qx, qy
+
+
+def _proven_overlaps(
+    rows: npt.NDArray[np.intp],
+    cols: npt.NDArray[np.intp],
+    pair_i: npt.NDArray[np.intp],
+    pair_j: npt.NDArray[np.intp],
+    thresh: npt.NDArray[np.float64],
+    cert: LayoutCert,
+) -> npt.NDArray[np.bool_]:
+    """候補ペアのうち「交差面積 > 閾値」を GEOS 無しで証明できたものを返す。
+
+    面ごとに「内部に確実に入る円板」を前計算してあるので（:func:`_face_probes`）、
+    剛体変換で配置したあとの中心と半径を使えばいい。両方向を試す。
+
+    健全性: 証明できたペアは**本当に**面積 > 閾値なので、判定（重なりが1つでも
+    あれば不正）は変わらない。証明できなかったペアは従来どおり
+    ``Polygon.intersection`` で判定するので、呼び出し回数は増えない。
+    """
+    pi = pair_i[cols]
+    pj = pair_j[cols]
+    fx = cert.flat_x
+    fy = cert.flat_y
+    pad = cert.padding
+    qx, qy = _placed_probes(fx, fy, rows, pi, cert)
+    proven = _probe_disk_hits(
+        qx, qy, cert.probe_r[pi], fx[rows[:, None], pad[pj]], fy[rows[:, None], pad[pj]], thresh
+    )
+    if not proven.all():
+        rx, ry = _placed_probes(fx, fy, rows, pj, cert)
+        proven |= _probe_disk_hits(
+            rx,
+            ry,
+            cert.probe_r[pj],
+            fx[rows[:, None], pad[pi]],
+            fy[rows[:, None], pad[pi]],
+            thresh,
+        )
+    return proven
+
+
 def _valid_batch(
     polys_list: list[Any],
     bnds: npt.NDArray[np.float64],
     trees_arr: npt.NDArray[np.intp],
+    cert: LayoutCert | None = None,
 ) -> list[bool]:
     """窓内の全展開図の重なり判定を、**外接矩形の絞り込みだけ**一括で行う。
 
@@ -952,9 +1225,14 @@ def _valid_batch(
 
     交差計算そのものは**逐次・早期終了**のまま（重なりを見つけた時点で
     打ち切るので、全ペアを計算するより速い。stairs では交差 51,605 回に対し
-    候補 124,039 ペア）。ここでやるのは「交差計算に進む面対」の絞り込みだけで、
-    式も順序も :func:`is_valid_layout` と同一。よって呼ぶ intersection の回数も
-    順序も完全に一致し、結果はビット単位で同じ。
+    候補 124,039 ペア）。
+
+    ``cert`` を渡すと、候補ペアのうち「交差面積 > 閾値」を numpy だけで
+    証明できたものを先に落とす（:func:`_proven_overlaps`）。判定は
+    「重なりが1つでもあれば不正」なので順序に依らず、証明できた候補を
+    持つネットはその場で不正が確定する。証明できなかった候補は従来どおり
+    :meth:`Polygon.intersection` で判定する。よって**同じ判定**を、より少ない
+    GEOS 呼び出しで得られる（証明の健全性は :func:`_probe_disk_hits` を参照）。
 
     ``trees_arr`` は ``(B, F-1, 2)`` の辺（折り線を共有する面対は重ならないので
     候補から外す）。
@@ -991,6 +1269,17 @@ def _valid_batch(
     out = [True] * n_batch
     if rows.size == 0:
         return out
+    if cert is not None:
+        proven = _proven_overlaps(rows, cols, pair_i, pair_j, thresh[rows, cols], cert)
+        if proven.any():
+            bad = np.zeros(n_batch, dtype=bool)
+            bad[rows[proven]] = True
+            out = (~bad).tolist()
+            keep = ~bad[rows]
+            rows = rows[keep]
+            cols = cols[keep]
+            if rows.size == 0:
+                return out
     counts = np.bincount(rows, minlength=n_batch)
     col_list = cols.tolist()
     thr_list = thresh[rows, cols].tolist()
@@ -1985,13 +2274,14 @@ def iter_unique_nets(
 
         if not pending:
             continue
-        all_polys, bnds = _layout_batch(len(faces), pending, layout_prep)
+        all_polys, bnds, cert = _layout_batch(len(faces), pending, layout_prep)
 
-        # 重なり判定も窓単位でベクトル化する（外接矩形の絞り込みだけ）。
-        # 交差計算は 1 本ずつ逐次に early-exit するので、結果は
-        # is_valid_layout を順に呼んだ場合とビット単位で同じ。
+        # 重なり判定も窓単位でベクトル化する（外接矩形の絞り込み + GEOS を
+        # 呼ばない証明）。判定は is_valid_layout を順に呼んだ場合と常に一致する
+        # （証明できた候補は本当に重なっているので、early-exit の結果は変わらない。
+        # ただし intersection の**呼び出し回数**は減る）。
         ok_flags = _valid_batch(
-            all_polys, bnds, _trees_to_array(pending, len(faces) - 1)
+            all_polys, bnds, _trees_to_array(pending, len(faces) - 1), cert
         )
         for tree, polys, ok in zip(pending, all_polys, ok_flags):
             if not ok:

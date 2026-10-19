@@ -19,8 +19,8 @@ import numpy as np
 import fifth
 from bench_ladder import SOLIDS
 
-ACC = {"prefilter": 0.0, "extract": 0.0, "loop_scan": 0.0, "intersect": 0.0}
-N = {"candidates": 0, "intersections": 0, "nets": 0, "cand_nets": 0}
+ACC = {"prefilter": 0.0, "proof": 0.0, "extract": 0.0, "loop_scan": 0.0, "intersect": 0.0}
+N = {"candidates": 0, "intersections": 0, "nets": 0, "cand_nets": 0, "proven": 0}
 
 
 def main() -> None:
@@ -33,7 +33,7 @@ def main() -> None:
     pair_i = np.array([i for i, _ in pairs], dtype=np.intp)
     pair_j = np.array([j for _, j in pairs], dtype=np.intp)
 
-    def timed(polys_list, bnds, trees_arr):  # type: ignore[no-untyped-def]
+    def timed(polys_list, bnds, trees_arr, cert=None):  # type: ignore[no-untyped-def]
         n_batch = len(polys_list)
         n_faces = bnds.shape[1]
         if n_batch == 0 or n_faces < 2:
@@ -58,7 +58,22 @@ def main() -> None:
         t = time.perf_counter()
         rows, cols = np.nonzero(cand)
         out = [True] * n_batch
-        counts = np.bincount(rows, minlength=n_batch)
+        if cert is not None and rows.size:
+            proven = fifth._proven_overlaps(
+                rows, cols, pair_i, pair_j, thresh[rows, cols], cert
+            )
+            N["proven"] += int(proven.sum())
+            if proven.any():
+                bad = np.zeros(n_batch, dtype=bool)
+                bad[rows[proven]] = True
+                out = (~bad).tolist()
+                keep = ~bad[rows]
+                rows = rows[keep]
+                cols = cols[keep]
+        ACC["proof"] += time.perf_counter() - t
+
+        t = time.perf_counter()
+        counts = np.bincount(rows, minlength=n_batch) if rows.size else np.zeros(0, dtype=int)
         col_list = cols.tolist()
         thr_list = thresh[rows, cols].tolist()
         ACC["extract"] += time.perf_counter() - t
@@ -93,6 +108,7 @@ def main() -> None:
     print(f"{name}: nets={n} pipeline={total:.3f}s")
     print(f"  nets in batch   : {N['nets']}  (候補あり {N['cand_nets']})")
     print(f"  candidates      : {N['candidates']}  intersections: {N['intersections']}")
+    print(f"  proven (GEOS 省略): {N['proven']}")
     for k, s in ACC.items():
         print(f"  {k:12s} {s:7.3f}s  ({s / total * 100:5.1f}%)")
 
