@@ -274,7 +274,8 @@ def enumerate_spanning_trees(
     # 自己ループは全域木に含まれ得ないので除く。多重辺は別の辺なので残す。
     # (元の辺番号, u, v) の組で持つ。縮約しても元の番号を失わないため。
     base = [(i, u, v) for i, (u, v) in enumerate(edges) if u != v]
-    endpoints = {i: (u, v) for i, u, v in base}
+    # 辺番号 -> 端点。1 本につき 1 回引くだけなので dict より list が速い。
+    endpoint_of: list[tuple[int, int]] = list(edges)
     if not _is_connected_edges(base, num_nodes):
         return
 
@@ -292,15 +293,21 @@ def enumerate_spanning_trees(
                 break
         if pivot < 0:
             if n == 1:  # 使える辺が尽き、頂点が1つなら全域木が完成している
-                # 端点は元の辺定義から取り出すので、縮約の過程に影響されない
-                yield [endpoints[i] for i in sorted(chosen)]
+                # 端点は元の辺定義から取り出すので、縮約の過程に影響されない。
+                # ⚠️ chosen は既に昇順（再帰の各段で「cur の先頭にある非ループ辺」
+                # を取るので、辺番号は必ず増える）。sorted() は要らない
+                # （tools/check_enum_bits.py で HEAD と列として一致することを確認）。
+                yield [endpoint_of[i] for i in chosen]
             return
 
         orig, pu, pv = cur[pivot]
-        rest = cur[:pivot] + cur[pivot + 1:]
+        # pivot は cur の先頭にあることが多い（cur[:0] + cur[1:] の写しを1回減らす）。
+        rest = cur[1:] if pivot == 0 else cur[:pivot] + cur[pivot + 1:]
 
         # (1) pivot を使わない全域木
-        if _is_connected_edges(rest, n):
+        # 連結なグラフは辺が n-1 本以上必要なので、足りなければ判定ごと省く
+        # （判定結果は必ず False になるので、出力は変わらない）。
+        if len(rest) >= n - 1 and _is_connected_edges(rest, n):
             yield from rec(rest, n, chosen)
 
         # (2) pivot を使う全域木：pivot の両端を縮約して、縮約後の全域木に対応させる
@@ -310,12 +317,19 @@ def enumerate_spanning_trees(
         # remap をインライン化する（関数呼び出しを避ける）。
         # ⚠️ 整数演算のみで**幾何の丸め演算には触れない**。列挙順序も
         # 変わらないので、出力される辺列は bit 単位で一致する。
-        contracted = []
-        for i, a, b in rest:
-            a2 = merged if (a == pu or a == pv) else a - (pu < a) - (pv < a)
-            b2 = merged if (b == pu or b == pv) else b - (pu < b) - (pv < b)
-            contracted.append((i, a2, b2))
-        yield from rec(contracted, n - 1, chosen + [orig])
+        contracted = [
+            (
+                i,
+                merged if (a == pu or a == pv) else a - (pu < a) - (pv < a),
+                merged if (b == pu or b == pv) else b - (pu < b) - (pv < b),
+            )
+            for i, a, b in rest
+        ]
+        # chosen は「今の枝の辺」を共有して push/pop する（毎段で list を写さない）。
+        # 葉では新しい list を作って返すので、yield 後に書き換えても安全。
+        chosen.append(orig)
+        yield from rec(contracted, n - 1, chosen)
+        chosen.pop()
 
     yield from rec(base, num_nodes, [])
 
