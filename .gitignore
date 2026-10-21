@@ -6,6 +6,12 @@ dist/
 wheels/
 *.egg-info
 cuboids/**
+nets/**
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environments
 .venv

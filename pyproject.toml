@@ -1,14 +1,38 @@
 [project]
 name = "pbl2-second"
 version = "0.1.0"
-description = "Add your description here"
+description = "任意の多面体からユニークな展開図を列挙し、JSON と PNG 画像で返す"
 readme = "README.md"
 requires-python = ">=3.13.11"
 dependencies = [
-    "mypy>=2.1.0",
-    "networkx>=3.6.1",
+    "fastapi>=0.139.0",
+    "matplotlib>=3.10",
     "numpy>=2.5.0",
     "shapely>=2.1.2",
+    "uvicorn>=0.35",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.13.1",
+    "mypy>=2.1.0",
+    # networkx は test_fifth.py の _brute_force_trees（全域木列挙の参照実装）だけが使う。
+    # 本体（fifth.py / api_server.py / make_nets.py）は VF2 削除済みで依存しない。
+    "networkx>=3.6.1",
+    "pytest>=9.1.1",
     "types-networkx>=3.6.1.20260612",
     "types-shapely>=2.1.0.20260603",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: 数秒かかる重いケース。`-m 'not slow'` で除外できる",
+]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["fifth.py", "api_server.py", "make_nets.py"]
+strict = true
+# networkx は本体から消えた（PR4 で VF2 を削除、dev 専用にした）。
+# テスト側にある _brute_force_trees だけが使うので、
+# 本体の型検査には現れない。
