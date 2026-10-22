@@ -51,8 +51,18 @@ def main() -> None:
     print(f"{name}: trees={len(trees)} windows={len(windows)} rows/window={window}")
 
     # 出力が一致することの確認（全窓）。
+    # 本番は Polygon を「残った行だけ」作るが、ここでは従来と同条件で比べるため
+    # 全行ぶん作る（_build_polys は行を選べる）。
+    def new_side(w: list[list[tuple[int, int]]]) -> tuple[list[Any], Any]:
+        batch = fifth._layout_batch(len(faces), w, prep)
+        built = fifth._build_polys(prep, batch.xs, batch.ys)
+        polys = [
+            built[b * len(faces) : (b + 1) * len(faces)] for b in range(len(w))
+        ]
+        return polys, batch.bnds
+
     for w in windows:
-        a = fifth._layout_batch(len(faces), w, prep)
+        a = new_side(w)
         b = getattr(old, "_layout_batch")(len(faces), w, prep)
         if digest(a) != digest(b):
             raise SystemExit("出力が不一致")
@@ -64,9 +74,9 @@ def main() -> None:
         for i, w in enumerate(windows):
             order = ("new", "old") if (r + i) % 2 == 0 else ("old", "new")
             for label in order:
-                fn = fifth._layout_batch if label == "new" else getattr(old, "_layout_batch")
+                fn = new_side if label == "new" else getattr(old, "_layout_batch")
                 t0 = time.perf_counter()
-                fn(len(faces), w, prep)
+                fn(w)
                 dt = time.perf_counter() - t0
                 if label == "new":
                     t_new += dt

@@ -875,31 +875,58 @@ def layout_tree(
     return list(built)
 
 
-class LayoutCert(NamedTuple):
-    """窓単位で「重なりを GEOS 無しで証明する」ための座標（:func:`_proven_overlaps`）。
+class LayoutBatch(NamedTuple):
+    """窓単位の展開結果（Polygon は必要な行だけ後で作る）。
 
-    ``_layout_batch`` が既に持っている頂点座標 ``flat_x/flat_y`` をそのまま渡し、
-    面ごとの探針は**候補ペアの分だけ** :func:`_proven_overlaps` で作る
-    （全 (窓, 面) について先に作ると、展開の 1 割ほど余計にかかる）。
+    ``xs``/``ys`` は窓内の全頂点の投影座標（``prepare_layout`` の ``flat_pts``
+    と同じ順＝面の順に連結）。``bnds`` は面ごとの外接矩形 ``(B, F, 4)``。
 
-    ``padding`` は各面の頂点の添字（頂点数が面ごとに違うので最大頂点数まで
-    先頭頂点で埋めたもの）、``anchor`` は探針のアフィン基準（各面の先頭3頂点）、
-    ``probe_ab``/``probe_r`` は探針の係数と半径（:func:`_face_probes`）。
+    Polygon をここで作らないのは、重なり判定を通るネットが全体の 1〜2 割しか
+    ないため（stairs で 37,704 中 5,714）。GEOS が要るネットだけ
+    :func:`_build_polys` でまとめて作る。
     """
 
-    flat_x: npt.NDArray[np.float64]
-    flat_y: npt.NDArray[np.float64]
-    padding: npt.NDArray[np.intp]
-    anchor: npt.NDArray[np.intp]
-    probe_ab: npt.NDArray[np.float64]
-    probe_r: npt.NDArray[np.float64]
+    xs: npt.NDArray[np.float64]
+    ys: npt.NDArray[np.float64]
+    bnds: npt.NDArray[np.float64]
+
+
+def _build_polys(
+    precomputed: Layout,
+    xs: npt.NDArray[np.float64],
+    ys: npt.NDArray[np.float64],
+    rows: npt.NDArray[np.intp] | None = None,
+) -> list[Polygon]:
+    """選択した行の Polygon をまとめて作る（``rows=None`` なら全行）。
+
+    面を shapely の Polygon に変換する。1 枚ずつ ``Polygon()`` を呼ぶと、頂点数が
+    混在する立体（角錐台の底面など 8角形と四角形）では Python 呼び出しが
+    面数だけかかる。``indices``（座標ごとの「どの面か」）は面の頂点数だけで
+    決まるので前計算済み（``flat_indices``）で、行を選んだときは行番号ぶんを
+    足すだけ（ring の生成は ring ごとに独立なので結果は 1 本ずつと同じ）。
+    """
+    if rows is None:
+        x = xs
+        y = ys
+    else:
+        x = xs[rows]
+        y = ys[rows]
+    n_sel = x.shape[0]
+    n_faces = precomputed["probe_anchor"].shape[0]
+    flat = np.column_stack([x.ravel(), y.ravel()])
+    ring_idx = (
+        np.arange(n_sel, dtype=np.intp)[:, None] * n_faces
+        + precomputed["flat_indices"][None, :]
+    ).ravel()
+    built = shapely.polygons(shapely.linearrings(flat, indices=ring_idx))
+    return cast(list[Polygon], built)
 
 
 def _layout_batch(
     n_faces: int,
     trees: list[list[tuple[int, int]]],
     precomputed: Layout,
-) -> tuple[list[Any], npt.NDArray[np.float64], LayoutCert]:
+) -> LayoutBatch:
     """窓内の複数の木をまとめて展開する（:func:`layout_tree` と同じ結果）。
 
     1 本ずつ ``layout_tree`` を呼ぶと、面数が 10 程度では**計算量ではなく
@@ -920,20 +947,17 @@ def _layout_batch(
     - 投影の成分ごとの積和は要素ごとの演算なので一致。
     - ``linearrings`` は ring ごとに独立なので、座標を連結しても同じ ring になる。
 
-    ``trees`` の順に Polygon のリストを返す。あわせて各ポリゴンの外接矩形
-    （``(B, F, 4)`` の ``[minx, miny, maxx, maxy]``）と、重なり判定の証明用の
-    探針座標（:class:`LayoutCert`）を返す（どちらも :func:`_valid_batch` 用）。
+    ``trees`` の順に、投影座標 ``xs``/``ys`` と面ごとの外接矩形 ``bnds``
+    （``(B, F, 4)`` の ``[minx, miny, maxx, maxy]``）を :class:`LayoutBatch` で返す。
+    Polygon は :func:`_build_polys` で必要な行だけ作る（GEOS まで残るネットは
+    全体の 1〜2 割なので、ここで全部作ると損）。
     """
     n_batch = len(trees)
     if n_batch == 0:
-        empty = np.empty((0, n_faces, 4), dtype=np.float64)
-        return [], empty, LayoutCert(
+        return LayoutBatch(
             np.empty((0, 0)),
             np.empty((0, 0)),
-            precomputed["flat_pad"],
-            precomputed["probe_anchor"],
-            precomputed["probe_ab"],
-            precomputed["probe_r"],
+            np.empty((0, n_faces, 4)),
         )
     n_edges = n_faces - 1
 
@@ -1003,35 +1027,15 @@ def _layout_batch(
         + cs_y[:, idx_rows]
     )
 
-    # 全木の座標を 1 本に連結し、ring の対応だけ木ごとにずらす。
-    # ring の生成は ring ごとに独立なので、まとめても 1 本ずつと同じ形になる。
-    flat = np.column_stack([xs.ravel(), ys.ravel()])
-    ring_idx = (np.arange(n_batch)[:, None] * n_faces + idx_rows[None, :]).ravel()
-    rings = shapely.linearrings(flat, indices=ring_idx)
-    # 実行時は numpy の object array だが、添字で切って list にすれば同じ。
-    built = cast(list[Polygon], shapely.polygons(rings))
+    # 外接矩形は投影座標からそのまま作る（shapely.bounds を呼ばない）。
+    # 面ごとの頂点数は違うので、最大頂点数まで先頭頂点で埋めた添字を使う
+    # （先頭頂点の重複は min/max を変えない）。
+    pad = precomputed["flat_pad"]
+    vx = xs[:, pad]  # (B, F, max_len)
+    vy = ys[:, pad]
+    bnds = np.stack([vx.min(axis=2), vy.min(axis=2), vx.max(axis=2), vy.max(axis=2)], axis=2)
 
-    # 外接矩形も一緒に返す。:func:`_valid_batch` が交差計算の前に
-    # 「外接矩形が重なる面対」を numpy で一括で絞り込むのに要る
-    # （1 本ずつ ``polygons[i].bounds`` を取ると呼び出し回数だけで 0.3 秒食う）。
-    bnds = np.asarray(shapely.bounds(built), dtype=np.float64).reshape(n_batch, n_faces, 4)
-
-    # 重なり判定の証明用に、配置済みの頂点座標と前計算の表をそのまま渡す
-    # （探針の位置は :func:`_proven_overlaps` が候補ペアの分だけ作る）。
-    cert = LayoutCert(
-        xs,
-        ys,
-        precomputed["flat_pad"],
-        precomputed["probe_anchor"],
-        precomputed["probe_ab"],
-        precomputed["probe_r"],
-    )
-
-    return (
-        [built[b * n_faces : (b + 1) * n_faces] for b in range(n_batch)],
-        bnds,
-        cert,
-    )
+    return LayoutBatch(xs, ys, bnds)
 
 
 def is_valid_layout(
@@ -1165,15 +1169,15 @@ def _placed_probes(
     fy: npt.NDArray[np.float64],
     rows: npt.NDArray[np.intp],
     faces: npt.NDArray[np.intp],
-    cert: LayoutCert,
+    precomputed: Layout,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """候補ペアの「探針の位置」を配置済み座標から作る（(n, K) を2本）。
 
     投影は 3D 点についてアフィンなので、面の先頭3頂点の像とアフィン係数だけで
     探針の像が出る（:func:`_face_probes`）。
     """
-    anchor = cert.anchor[faces]  # (n, 3)
-    ab = cert.probe_ab[faces]  # (n, K, 2)
+    anchor = precomputed["probe_anchor"][faces]  # (n, 3)
+    ab = precomputed["probe_ab"][faces]  # (n, K, 2)
     x0 = fx[rows, anchor[:, 0]][:, None]  # (n, 1)
     x1 = fx[rows, anchor[:, 1]][:, None]
     x2 = fx[rows, anchor[:, 2]][:, None]
@@ -1189,19 +1193,20 @@ def _prove_direction(
     rows: npt.NDArray[np.intp],
     probe_of: npt.NDArray[np.intp],
     poly_of: npt.NDArray[np.intp],
-    cert: LayoutCert,
+    layout: LayoutBatch,
+    precomputed: Layout,
     ks: slice,
     thresh: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.bool_]:
     """「面 probe_of の探針（``ks`` の範囲）が面 poly_of の内部に深く入る」を判定する。"""
-    fx = cert.flat_x
-    fy = cert.flat_y
-    pad = cert.padding
-    qx, qy = _placed_probes(fx, fy, rows, probe_of, cert)
+    fx = layout.xs
+    fy = layout.ys
+    pad = precomputed["flat_pad"]
+    qx, qy = _placed_probes(fx, fy, rows, probe_of, precomputed)
     return _probe_disk_hits(
         qx[:, ks],
         qy[:, ks],
-        cert.probe_r[probe_of][:, ks],
+        precomputed["probe_r"][probe_of][:, ks],
         fx[rows[:, None], pad[poly_of]],
         fy[rows[:, None], pad[poly_of]],
         thresh,
@@ -1214,7 +1219,8 @@ def _proven_overlaps(
     pair_i: npt.NDArray[np.intp],
     pair_j: npt.NDArray[np.intp],
     thresh: npt.NDArray[np.float64],
-    cert: LayoutCert,
+    layout: LayoutBatch,
+    precomputed: Layout,
 ) -> npt.NDArray[np.bool_]:
     """候補ペアのうち「交差面積 > 閾値」を GEOS 無しで証明できたものを返す。
 
@@ -1236,7 +1242,7 @@ def _proven_overlaps(
     pj = pair_j[cols]
     # (向きを反転するか, 探針の範囲)。安い1本目を両方向→残りを両方向。
     passes: list[tuple[bool, slice]] = [(False, slice(0, 1)), (True, slice(0, 1))]
-    if cert.probe_r.shape[1] > 1:
+    if precomputed["probe_r"].shape[1] > 1:
         passes.append((False, slice(1, None)))
         passes.append((True, slice(1, None)))
     todo = np.ones(n, dtype=bool)
@@ -1249,17 +1255,18 @@ def _proven_overlaps(
             probe_of, poly_of = pair_j[c], pair_i[c]
         else:
             probe_of, poly_of = pair_i[c], pair_j[c]
-        proven[idx] |= _prove_direction(rows[idx], probe_of, poly_of, cert, ks, thresh[idx])
+        proven[idx] |= _prove_direction(
+            rows[idx], probe_of, poly_of, layout, precomputed, ks, thresh[idx]
+        )
         todo[idx] = ~proven[idx]
     return proven
 
 
 def _valid_batch(
-    polys_list: list[Any],
-    bnds: npt.NDArray[np.float64],
+    layout: LayoutBatch,
     trees_arr: npt.NDArray[np.intp],
-    cert: LayoutCert | None = None,
-) -> list[bool]:
+    precomputed: Layout,
+) -> tuple[list[bool], list[list[Polygon] | None]]:
     """窓内の全展開図の重なり判定を、**外接矩形の絞り込みだけ**一括で行う。
 
     :func:`is_valid_layout` の判定式をそのまま numpy で、しかも窓の全ネットに
@@ -1271,22 +1278,30 @@ def _valid_batch(
     打ち切るので、全ペアを計算するより速い。stairs では交差 51,605 回に対し
     候補 124,039 ペア）。
 
-    ``cert`` を渡すと、候補ペアのうち「交差面積 > 閾値」を numpy だけで
-    証明できたものを先に落とす（:func:`_proven_overlaps`）。判定は
-    「重なりが1つでもあれば不正」なので順序に依らず、証明できた候補を
-    持つネットはその場で不正が確定する。証明できなかった候補は従来どおり
-    :meth:`Polygon.intersection` で判定する。よって**同じ判定**を、より少ない
-    GEOS 呼び出しで得られる（証明の健全性は :func:`_probe_disk_hits` を参照）。
+    まず候補ペアのうち「交差面積 > 閾値」を numpy だけで証明できたものを落とす
+    （:func:`_proven_overlaps`）。判定は「重なりが1つでもあれば不正」なので
+    順序に依らず、証明できた候補を持つネットはその場で不正が確定する。
+    証明できなかった候補は従来どおり :meth:`Polygon.intersection` で判定する。
+    よって**同じ判定**を、より少ない GEOS 呼び出しで得られる
+    （証明の健全性は :func:`_probe_disk_hits` を参照）。
+
+    Polygon は**GEOS まで残ったネットと、候補が 1 つも無いネットだけ**作る
+    （前者は判定に、後者は出力に要る。候補が無いネットは必ず有効）。
+    stairs では 37,704 ネットのうち 5,714 ネットぶんで済む。
 
     ``trees_arr`` は ``(B, F-1, 2)`` の辺（折り線を共有する面対は重ならないので
-    候補から外す）。
+    候補から外す）。返り値は (有効フラグ, ネットごとの Polygon か None)。
     """
-    n_batch = len(polys_list)
+    n_batch = layout.bnds.shape[0]
     if n_batch == 0:
-        return []
-    n_faces = bnds.shape[1]
+        return [], []
+    n_faces = layout.bnds.shape[1]
     if n_faces < 2:
-        return [True] * n_batch
+        built = _build_polys(precomputed, layout.xs, layout.ys)
+        return [True] * n_batch, [
+            built[b * n_faces : (b + 1) * n_faces] for b in range(n_batch)
+        ]
+    bnds = layout.bnds
     pairs, pair_idx = pair_table(n_faces)
     pair_i = np.array([i for i, _ in pairs], dtype=np.intp)
     pair_j = np.array([j for _, j in pairs], dtype=np.intp)
@@ -1311,15 +1326,17 @@ def _valid_batch(
     # 添字昇順）で取り出して、ネットごとに逐次・早期終了で回す。
     rows, cols = np.nonzero(cand)
     out = [True] * n_batch
-    if rows.size == 0:
-        return out
-    if cert is not None:
+    counts_all = (
+        np.bincount(rows, minlength=n_batch)
+        if rows.size
+        else np.zeros(n_batch, dtype=np.intp)
+    )
+    if rows.size:
         # 候補を「ネットごとに1つずつ」波状に処理する。証明できたネットはその時点で
         # 不正が確定するので打ち切り、残りは次の候補へ進む（判定は順序に依らない）。
         # 全候補（stairs で 124,039 件）を一度に証明しようとすると、証明の numpy 計算
         # そのものが `intersection` より重くなる（実測 0.67s）。ネットの平均候補数は
         # 3.3 なので、波状にすると計算は約 1/2.3 で同じネットが証明できる。
-        counts_all = np.bincount(rows, minlength=n_batch)
         starts = np.zeros(n_batch, dtype=np.intp)
         np.cumsum(counts_all[:-1], out=starts[1:])
         bad = np.zeros(n_batch, dtype=bool)
@@ -1331,7 +1348,13 @@ def _valid_batch(
                 break
             sel = starts[nets] + wave
             hit = _proven_overlaps(
-                rows[sel], cols[sel], pair_i, pair_j, thresh[rows[sel], cols[sel]], cert
+                rows[sel],
+                cols[sel],
+                pair_i,
+                pair_j,
+                thresh[rows[sel], cols[sel]],
+                layout,
+                precomputed,
             )
             if hit.any():
                 bad[nets[hit]] = True
@@ -1343,8 +1366,20 @@ def _valid_batch(
             keep = ~bad[rows]
             rows = rows[keep]
             cols = cols[keep]
-            if rows.size == 0:
-                return out
+
+    # Polygon を作るネット: GEOS まで残ったネット（判定に要る）と、
+    # 候補が 1 つも無いネット（必ず有効なので出力に要る）。
+    need = counts_all == 0
+    need[rows] = True
+    need_idx = np.flatnonzero(need)
+    built = _build_polys(precomputed, layout.xs, layout.ys, need_idx)
+    polys_by_net: list[list[Polygon] | None] = [None] * n_batch
+    for b in range(need_idx.size):
+        base = b * n_faces
+        polys_by_net[int(need_idx[b])] = built[base : base + n_faces]
+    if rows.size == 0:
+        return out, polys_by_net
+
     counts = np.bincount(rows, minlength=n_batch)
     col_list = cols.tolist()
     thr_list = thresh[rows, cols].tolist()
@@ -1353,7 +1388,8 @@ def _valid_batch(
         n_cand = int(counts[k])
         if n_cand == 0:
             continue
-        polys = polys_list[k]
+        polys = polys_by_net[k]
+        assert polys is not None
         end = pos + n_cand
         for t in range(pos, end):
             i, j = pairs[col_list[t]]
@@ -1361,7 +1397,7 @@ def _valid_batch(
                 out[k] = False
                 break
         pos = end
-    return out
+    return out, polys_by_net
 
 
 class NetMetrics(NamedTuple):
@@ -2341,16 +2377,18 @@ def iter_unique_nets(
 
         if not pending:
             continue
-        all_polys, bnds, cert = _layout_batch(len(faces), pending, layout_prep)
+        batch = _layout_batch(len(faces), pending, layout_prep)
 
         # 重なり判定も窓単位でベクトル化する（外接矩形の絞り込み + GEOS を
         # 呼ばない証明）。判定は is_valid_layout を順に呼んだ場合と常に一致する
         # （証明できた候補は本当に重なっているので、early-exit の結果は変わらない。
         # ただし intersection の**呼び出し回数**は減る）。
-        ok_flags = _valid_batch(
-            all_polys, bnds, _trees_to_array(pending, len(faces) - 1), cert
+        # Polygon は判定・出力に要るネットだけ _valid_batch が作って返す。
+        ok_flags, polys_by_net = _valid_batch(
+            batch, _trees_to_array(pending, len(faces) - 1), layout_prep
         )
-        for tree, polys, ok in zip(pending, all_polys, ok_flags):
+        for tree, polys, ok in zip(pending, polys_by_net, ok_flags):
             if not ok:
                 continue
+            assert polys is not None
             yield tree, polys

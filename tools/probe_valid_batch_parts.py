@@ -1,7 +1,12 @@
-"""`_valid_batch` の内訳（外接矩形の絞り込み / 候補の取り出し / 交差計算）を測る。
+"""`_valid_batch` の内訳を、**本番の関数を包んで**測る（写しを持たない）。
 
-`_valid_batch` の中身をここに写して各部分の累計時間と交差計算の回数を数える。
-パイプラインを 1 回走らせるだけなので、分割の比が読めればよい。
+Cycle 35 で写しをやめた。写しは本番とずれるので、ここでは
+
+* `_proven_overlaps`（証明の numpy 計算）
+* `_build_polys`（GEOS に残ったネットだけの Polygon 生成）
+* `Polygon.intersection`（GEOS の交差計算）
+
+を包んで時間を積み、`_valid_batch` 全体から差し引いて「絞り込み・走査」を出す。
 
     uv run python tools/probe_valid_batch_parts.py stairs
 """
@@ -14,13 +19,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-import numpy as np
+import shapely.geometry
 
 import fifth
 from bench_ladder import SOLIDS
 
-ACC = {"prefilter": 0.0, "proof": 0.0, "extract": 0.0, "loop_scan": 0.0, "intersect": 0.0}
-N = {"candidates": 0, "intersections": 0, "nets": 0, "cand_nets": 0, "proven": 0}
+ST = {"proof": 0.0, "polys": 0.0, "intersect": 0.0, "total": 0.0, "nets": 0,
+      "proven": 0, "calls": 0, "cand": 0, "windows": 0}
 
 
 def main() -> None:
@@ -29,102 +34,76 @@ def main() -> None:
     faces = fifth.orient_faces_outward(v, f)
     normals = fifth.compute_normals(v, faces)
     edges = fifth.build_adjacency_graph(faces)
-    pairs, pair_idx = fifth.pair_table(len(faces))
-    pair_i = np.array([i for i, _ in pairs], dtype=np.intp)
-    pair_j = np.array([j for _, j in pairs], dtype=np.intp)
+    prep = fifth.prepare_layout(v, faces, normals)
 
-    def timed(polys_list, bnds, trees_arr, cert=None):  # type: ignore[no-untyped-def]
-        n_batch = len(polys_list)
-        n_faces = bnds.shape[1]
-        if n_batch == 0 or n_faces < 2:
-            return [True] * n_batch
-        N["nets"] += n_batch
-        t = time.perf_counter()
-        bi = bnds[:, pair_i, :]
-        bj = bnds[:, pair_j, :]
-        ax0, ay0, ax1, ay1 = bi[:, :, 0], bi[:, :, 1], bi[:, :, 2], bi[:, :, 3]
-        bx0, by0, bx1, by1 = bj[:, :, 0], bj[:, :, 1], bj[:, :, 2], bj[:, :, 3]
-        near = (ax1 >= bx0) & (bx1 >= ax0) & (ay1 >= by0) & (by1 >= ay0)
-        dx = np.maximum(ax1, bx1) - np.minimum(ax0, bx0)
-        dy = np.maximum(ay1, by1) - np.minimum(ay0, by0)
-        thresh = fifth.OVERLAP_AREA_REL_TOL * (dx * dx + dy * dy)
-        ox = np.minimum(ax1, bx1) - np.maximum(ax0, bx0)
-        oy = np.minimum(ay1, by1) - np.maximum(ay0, by0)
-        cand = near & (ox * oy > thresh)
-        cand[np.arange(n_batch, dtype=np.intp)[:, None],
-             pair_idx[trees_arr[:, :, 0], trees_arr[:, :, 1]]] = False
-        ACC["prefilter"] += time.perf_counter() - t
+    real_proof = fifth._proven_overlaps
+    real_polys = fifth._build_polys
+    real_valid = fifth._valid_batch
+    orig_intersection = shapely.geometry.Polygon.intersection
 
-        t = time.perf_counter()
-        rows, cols = np.nonzero(cand)
-        out = [True] * n_batch
-        if cert is not None and rows.size:
-            counts_all = np.bincount(rows, minlength=n_batch)
-            starts = np.zeros(n_batch, dtype=np.intp)
-            np.cumsum(counts_all[:-1], out=starts[1:])
-            bad = np.zeros(n_batch, dtype=bool)
-            alive = counts_all > 0
-            wave = 0
-            while True:
-                nets = np.nonzero(alive)[0]
-                if nets.size == 0:
-                    break
-                pos = starts[nets] + wave
-                hit = fifth._proven_overlaps(
-                    rows[pos], cols[pos], pair_i, pair_j, thresh[rows[pos], cols[pos]], cert
-                )
-                N["proven"] += int(hit.sum())
-                if hit.any():
-                    bad[nets[hit]] = True
-                alive[:] = False
-                alive[nets[(~hit) & (counts_all[nets] > wave + 1)]] = True
-                wave += 1
-            if bad.any():
-                out = (~bad).tolist()
-                keep = ~bad[rows]
-                rows = rows[keep]
-                cols = cols[keep]
-        ACC["proof"] += time.perf_counter() - t
+    def proof(*args, **kwargs):  # type: ignore[no-untyped-def]
+        t0 = time.perf_counter()
+        hit = real_proof(*args, **kwargs)
+        ST["proof"] += time.perf_counter() - t0
+        ST["proven"] += int(hit.sum())
+        ST["cand"] += int(hit.size)
+        return hit
 
-        t = time.perf_counter()
-        counts = np.bincount(rows, minlength=n_batch)
-        col_list = cols.tolist()
-        thr_list = thresh[rows, cols].tolist()
-        ACC["extract"] += time.perf_counter() - t
-        N["candidates"] += int(rows.size)
-        N["cand_nets"] += int(np.count_nonzero(counts))
-
-        t = time.perf_counter()
-        pos = 0
-        for k in range(n_batch):
-            n_cand = int(counts[k])
-            if n_cand == 0:
-                continue
-            polys = polys_list[k]
-            end = pos + n_cand
-            for tt in range(pos, end):
-                i, j = pairs[col_list[tt]]
-                N["intersections"] += 1
-                if polys[i].intersection(polys[j]).area > thr_list[tt]:
-                    out[k] = False
-                    break
-            pos = end
-        ACC["loop_scan"] += time.perf_counter() - t
+    def polys(*args, **kwargs):  # type: ignore[no-untyped-def]
+        t0 = time.perf_counter()
+        out = real_polys(*args, **kwargs)
+        ST["polys"] += time.perf_counter() - t0
         return out
 
-    fifth._valid_batch = timed
-    n = 0
-    t0 = time.perf_counter()
-    for _t, _p in fifth.iter_unique_nets(v, faces, fifth.enumerate_spanning_trees(edges, len(faces)), normals):
-        n += 1
-    total = time.perf_counter() - t0
+    def counting(self: object, other: object) -> object:
+        t0 = time.perf_counter()
+        out = orig_intersection(self, other)  # type: ignore[arg-type]
+        ST["intersect"] += time.perf_counter() - t0
+        ST["calls"] += 1
+        return out
 
-    print(f"{name}: nets={n} pipeline={total:.3f}s")
-    print(f"  nets in batch   : {N['nets']}  (候補あり {N['cand_nets']})")
-    print(f"  candidates      : {N['candidates']}  intersections: {N['intersections']}")
-    print(f"  proven (GEOS 省略): {N['proven']}")
-    for k, s in ACC.items():
-        print(f"  {k:12s} {s:7.3f}s  ({s / total * 100:5.1f}%)")
+    def valid(*args, **kwargs):  # type: ignore[no-untyped-def]
+        t0 = time.perf_counter()
+        out = real_valid(*args, **kwargs)
+        ST["total"] += time.perf_counter() - t0
+        ST["nets"] += len(out[0])
+        ST["windows"] += 1
+        return out
+
+    fifth._proven_overlaps = proof
+    fifth._build_polys = polys
+    fifth._valid_batch = valid
+    shapely.geometry.Polygon.intersection = counting  # type: ignore[method-assign]
+
+    t0 = time.perf_counter()
+    n = 0
+    try:
+        for _tree, _polys in fifth.iter_unique_nets(
+            v, faces, fifth.enumerate_spanning_trees(edges, len(faces)), normals
+        ):
+            n += 1
+    finally:
+        fifth._proven_overlaps = real_proof
+        fifth._build_polys = real_polys
+        fifth._valid_batch = real_valid
+        shapely.geometry.Polygon.intersection = orig_intersection  # type: ignore[method-assign]
+    total_pipeline = time.perf_counter() - t0
+
+    total = ST["total"]
+    rest = total - ST["proof"] - ST["polys"] - ST["intersect"]
+    print(f"{name}: nets={n} pipeline={total_pipeline:.3f}s")
+    print(f"  _valid_batch 全体 : {total:7.3f}s  ({ST['windows']} 窓, {ST['nets']} ネット)")
+    print(f"  candidates        : {ST['cand']}  proven: {ST['proven']}  "
+          f"intersections: {ST['calls']}")
+    for key, label in (
+        ("proof", "証明（numpy）"),
+        ("polys", "Polygon 生成"),
+        ("intersect", "GEOS 交差"),
+        ("rest", "絞り込み・走査"),
+    ):
+        t = rest if key == "rest" else ST[key]
+        pct = t / total * 100 if total else 0.0
+        print(f"  {label:16s} {t:7.3f}s ({pct:5.1f}%)")
 
 
 if __name__ == "__main__":

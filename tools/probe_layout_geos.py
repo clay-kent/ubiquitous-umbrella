@@ -72,7 +72,9 @@ def main() -> None:
     n = 0
     for i in range(0, len(trees), fifth._LADDER_WINDOW):
         window = trees[i : i + fifth._LADDER_WINDOW]
-        fifth._layout_batch(len(faces), window, layout_prep)
+        batch = fifth._layout_batch(len(faces), window, layout_prep)
+        # 本番は残った行だけ作るが、ここでは GEOS の固定費を測るため全行作る。
+        fifth._build_polys(layout_prep, batch.xs, batch.ys)
         ST["batches"] += 1
         ST["rows"] += len(window)
         n += len(window)

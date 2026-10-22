@@ -2,8 +2,8 @@
 
 `_valid_batch` を包んで、同じ窓に対して
 
-* 証明あり（本番）: `cert` を渡す
-* 証明なし（従来）: `cert=None`
+* 証明あり（本番）
+* 証明なし（`_proven_overlaps` を「何も証明しない」に差し替え）
 
 の両方を走らせ、**返る bool 列が完全に一致**することを確かめる。あわせて
 `Polygon.intersection` の呼び出し回数を数え、証明で何回減ったかを出す。
@@ -34,26 +34,37 @@ CALLS = {"n": 0}
 def main() -> None:
     names = sys.argv[1:] or DEFAULT
     real_valid = fifth._valid_batch
+    real_proof = fifth._proven_overlaps
     orig_intersection = shapely.geometry.Polygon.intersection
 
     def counting(self: object, other: object) -> object:
         CALLS["n"] += 1
         return orig_intersection(self, other)  # type: ignore[arg-type]
 
-    def wrapper(polys, bnds, trees, cert=None):  # type: ignore[no-untyped-def]
+    def no_proof(*args: object, **kwargs: object) -> object:
+        import numpy as np
+
+        rows = args[0]
+        return np.zeros(len(rows), dtype=bool)  # type: ignore[arg-type]
+
+    def wrapper(layout, trees, precomputed):  # type: ignore[no-untyped-def]
         STAT["batches"] += 1
         shapely.geometry.Polygon.intersection = counting  # type: ignore[method-assign]
         CALLS["n"] = 0
-        got = real_valid(polys, bnds, trees, cert)
+        got, _polys = real_valid(layout, trees, precomputed)
         STAT["with"] += CALLS["n"]
         CALLS["n"] = 0
-        ref = real_valid(polys, bnds, trees, None)
+        fifth._proven_overlaps = no_proof  # type: ignore[assignment]
+        try:
+            ref, _polys2 = real_valid(layout, trees, precomputed)
+        finally:
+            fifth._proven_overlaps = real_proof  # type: ignore[assignment]
         STAT["without"] += CALLS["n"]
         shapely.geometry.Polygon.intersection = orig_intersection  # type: ignore[method-assign]
         if got != ref:
             STAT["mismatch"] += 1
             print("  不一致の窓:", [i for i, (a, b) in enumerate(zip(got, ref)) if a != b][:8])
-        return got
+        return got, _polys
 
     fifth._valid_batch = wrapper
     ok = True

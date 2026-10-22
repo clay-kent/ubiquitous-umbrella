@@ -57,15 +57,14 @@ def main():
 
         # 本番（iter_unique_nets）と同じく窓単位でまとめて展開する。
         t0 = time.perf_counter()
-        all_polys, bnds, cert = fifth._layout_batch(len(faces), pending, prep)
+        batch = fifth._layout_batch(len(faces), pending, prep)
         t_layout += time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        n_valid += sum(
-            fifth._valid_batch(
-                all_polys, bnds, np.asarray(pending, dtype=np.intp), cert
-            )
+        ok_flags, _polys = fifth._valid_batch(
+            batch, np.asarray(pending, dtype=np.intp), prep
         )
+        n_valid += sum(ok_flags)
         t_valid += time.perf_counter() - t0
 
     print(f"{name}: trees={len(trees)} unique_keys={n_unique} valid={n_valid}")
