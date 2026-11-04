@@ -85,6 +85,61 @@ def pyramid(n: int, r: float = 1.0, h: float = 1.0) -> tuple[np.ndarray, list[li
     )
 
 
+def lathe(
+    profile: list[tuple[float, float]], n: int
+) -> tuple[np.ndarray, list[list[int]]]:
+    """(半径, 高さ) の輪郭を n 角形断面で回転させた立体。
+
+    輪郭の隣り合う 2 点を結ぶ四角形を側面として n 枚ずつ並べる。
+    輪郭を 1 点増やすと面数が n 枚増え、展開図の候補数が急増する。
+    """
+    angles = 2 * np.pi * np.arange(n) / n
+    vertices = np.array(
+        [[r * np.cos(a), r * np.sin(a), z] for r, z in profile for a in angles],
+        dtype=float,
+    )
+    faces = [list(range(n - 1, -1, -1))]
+    for k in range(len(profile) - 1):
+        lo, hi = k * n, (k + 1) * n
+        faces += [
+            [lo + i, lo + (i + 1) % n, hi + (i + 1) % n, hi + i] for i in range(n)
+        ]
+    top = (len(profile) - 1) * n
+    faces.append(list(range(top, top + n)))
+    return vertices, faces
+
+
+def namacha_bottle() -> tuple[np.ndarray, list[list[int]]]:
+    """キリン 生茶 525mL ペットボトルのローポリ近似。
+
+    市販 500mL ペットボトルの実寸は胴径 6.7〜6.9cm・全高 21cm 前後。
+    指定の 6.9 はこの胴径（直径）と一致するため、半径 3.45cm として扱う。
+    直胴部（細くなり始めるまで）は約 12cm、口栓部は 28mm（半径 1.4cm）、
+    キャップは 30mm（半径 1.5cm）。
+
+    展開図の候補数は面数に対して指数的に増えるので、断面は三角形の
+    3 バンド（胴・肩・首）に簡略化している。四角断面にすると面数が
+    14 枚になり、全域木が約 256 万通りまで増えて現実的な時間で終わらない。
+    """
+    profile = [
+        (3.3, 0.0),  # 底面
+        (3.45, 12.0),  # 胴（ラベル部）の上端
+        (1.4, 17.0),  # 肩の上端（口栓部の付け根）
+        (1.5, 21.0),  # キャップ天面
+    ]
+    return lathe(profile, 3)
+
+
+def namacha_box() -> tuple[np.ndarray, list[list[int]]]:
+    """生茶 525mL の円形ペットボトルが入る直方体の箱。
+
+    ボトルは胴径 6.9cm・全高 21cm。細くなり始めるまでの直胴部は約 12cm。
+    箱はボトル全体が入る最小の直方体とし、クリアランスは考えず
+    6.9 × 6.9 × 21cm にした。
+    """
+    return box(6.9, 21.0, 6.9)
+
+
 def l_shape() -> tuple[np.ndarray, list[list[int]]]:
     """凹角（270 度の内角）を持つ L 字柱。非凸立体の代表例。"""
     pts = [(0, 0), (3, 0), (3, 1), (1, 1), (1, 2), (0, 2)]
@@ -126,6 +181,8 @@ SOLIDS = {
     "pyr4": lambda: pyramid(4),
     "pyr5": lambda: pyramid(5),
     "lshape": l_shape,
+    "namacha": namacha_bottle,
+    "namacha_box": namacha_box,
     "cutout": cutout,
 }
 

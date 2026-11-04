@@ -60,9 +60,11 @@ python make_nets.py --solid prism5               # 5 角柱
 python make_nets.py --solid lshape --top-n 6 --sort-by perimeter
 python make_nets.py --solid lshape --top-n 6 --sort-by folds
 python make_nets.py --solid pyr4 --outdir images
+python make_nets.py --solid namacha --top-n 3   # 生茶 525mL ペットボトル（ローポリ近似）
+python make_nets.py --solid namacha_box         # 生茶が入る直方体の箱
 ```
 
-- `--solid`: `box` / `tetra` / `prism3` / `prism4` / `prism5` / `pyr4` / `pyr5` / `lshape` / `cutout`
+- `--solid`: `box` / `tetra` / `prism3` / `prism4` / `prism5` / `pyr4` / `pyr5` / `lshape` / `namacha` / `namacha_box` / `cutout`
 - `--top-n`: 保存する枚数（0 で全件、既定 0）
 - `--sort-by`: `area`（外接矩形の面積）/ `perimeter`（外周長）/ `folds`（折る回数）
 - `--outdir`: 保存先ディレクトリ（既定 `nets`）

@@ -813,7 +813,7 @@ def test_every_make_nets_preset_is_a_valid_solid():
 
     assert set(make_nets.SOLIDS) == {
         "box", "tetra", "prism3", "prism4", "prism5",
-        "pyr4", "pyr5", "lshape", "cutout",
+        "pyr4", "pyr5", "lshape", "namacha", "namacha_box", "cutout",
     }
     for name, builder in make_nets.SOLIDS.items():
         v, f = builder()
