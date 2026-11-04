@@ -5,6 +5,7 @@
 - **展開図（全域木）の列挙と一意性判定**: 面をグラフノードとし、隣接関係から全域木を列挙。半辺構造の正規形（個別化-細分）で重複を潰し、ユニークな展開図のみを抽出します。**回転・並進・鏡映は同一視**するため、立方体は 11 種です（112 ではありません）。
 - **2D 自動レイアウト**: 各面の 3D 幾何構造を展開し、Shapely を使用して 2D ポリゴン座標に変換。自己交差（重なり）のない正しい展開図のみを返します。
 - **折り組み立て情報の出力**: 面ごとの 2D 座標、親子関係、内側の二面角、折り曲げ角（= 180 − 二面角）、3D / 2D の折り曲げ軸。
+- **評価指標**: 外接矩形の面積、外周長、折る回数（同じ直線上で同じ折り方の折り曲げ軸を 1 回にまとめた本数）。
 - **画像出力**: 展開図の 2D レイアウトをプロットし、PNG ファイルとしてローカルディレクトリに保存します。
 - **FastAPI による Web API サーバー**: `POST /api/net/calculate` 1 本のみ。評価指標の上位 n 個を JSON で返します。
 - **ユニット/統合テスト**: pytest による網羅的なテスト。
@@ -57,12 +58,13 @@ pip install fastapi uvicorn shapely numpy matplotlib pytest httpx2
 python make_nets.py                              # 既定の直方体 (1.0 x 1.5 x 2.0)
 python make_nets.py --solid prism5               # 5 角柱
 python make_nets.py --solid lshape --top-n 6 --sort-by perimeter
+python make_nets.py --solid lshape --top-n 6 --sort-by folds
 python make_nets.py --solid pyr4 --outdir images
 ```
 
 - `--solid`: `box` / `tetra` / `prism3` / `prism4` / `prism5` / `pyr4` / `pyr5` / `lshape` / `cutout`
 - `--top-n`: 保存する枚数（0 で全件、既定 0）
-- `--sort-by`: `area`（外接矩形の面積）/ `perimeter`（外周長）
+- `--sort-by`: `area`（外接矩形の面積）/ `perimeter`（外周長）/ `folds`（折る回数）
 - `--outdir`: 保存先ディレクトリ（既定 `nets`）
 
 > **`--sort-by perimeter` の定義変更（v3 PR3）**
@@ -96,7 +98,7 @@ uvicorn api_server:app --reload
     - `vertices` (必須, `number[][]`): 頂点座標 `[[x, y, z], ...]`
     - `faces` (必須, `integer[][]`): 各面の頂点インデックス。三角形・四角形・N 角形の混在可。**巻き順は任意**（外向きに正規化される）
     - `top_n` (任意, `1〜10000`, 既定 `1`): 返す展開図の数
-    - `sort_by` (任意, `area` / `perimeter`, 既定 `area`): 並べ替えの基準
+    - `sort_by` (任意, `area` / `perimeter` / `folds`, 既定 `area`): 並べ替えの基準
   - **レスポンス**: 展開図の JSON。スキーマは [specification.md] を参照。
   - **422 で返る場合**: 入力エラー（面数不足・頂点インデックス範囲外・非平面な面・境界あり・非連結・有限でない座標・未知のフィールド）と、計算量の上限超過（全域木が 10,000 本超）。**後者は入力が間違っているわけではなく**、詳細は「既知の制限」を参照。
     なお**凹角（非凸）や貫通穴は 422 にしません**。正当な入力として受理します。
@@ -138,7 +140,8 @@ uvicorn api_server:app --reload
       "metrics": {
         "bounding_box": { "width": 5.0, "height": 2.0 },
         "bounding_box_area": 10.0,
-        "perimeter": 14.0
+        "perimeter": 14.0,
+        "fold_count": 5
       },
       "faces": [
         {
@@ -178,6 +181,7 @@ uvicorn api_server:app --reload
 | `metrics.bounding_box` | 展開図の外接矩形の幅・高さ |
 | `metrics.bounding_box_area` | 外接矩形の面積 |
 | `metrics.perimeter` | 展開図の外周長 = 全面の周長合計 − 2 × 折り曲げ軸の長さ合計。外接矩形の周長ではない |
+| `metrics.fold_count` | 折る回数 = 同じ直線上で山折り/谷折りと折り角が同じ軸を 1 回にまとめた本数（→「折る回数の定義」） |
 | `vertices_2d` | 展開図上のその面の頂点座標（頂点数は元の面と一致） |
 | `parent_face_id` | 展開図の木構造における親の面。根（面0）は `null` |
 | `dihedral_angle` | 親の面との**内側の二面角**（度）。凸角は 0〜180、凹角は 180〜360。根は `null` |
@@ -186,6 +190,16 @@ uvicorn api_server:app --reload
 | `fold_axis_2d` | 展開図上の折り曲げ軸（この面の `vertices_2d` に含まれる 2 点）。根は `null` |
 
 非凸の立体では `dihedral_angle` が 180 度を超えます。例えば凹角のある L 字柱では 270 度、対応する `fold_angle` は −90 度です。
+
+#### 折る回数の定義
+
+展開図の折り曲げ軸（全域木の辺）は必ず「面数 − 1」本あります。同じ直線上にあり、かつ折り角（山折り/谷折りとその大きさ）が等しい軸は 1 回の折り操作でまとめて折れるので、`fold_count` は**「直線 + 折り方」ごとにまとめた本数**とします。
+
+- 単位立方体の 11 種はすべて 5（= 6 − 1）。
+- L 字柱の 1516 種は 6 または 7（= 8 − 1）。`sort_by: "folds"` では 6 回で折れる展開図が先に来ます。
+- 同じ直線上でも、山折りと谷折りが混在する場合や折り角の大きさが違う場合は別の折り操作として数えます。1 回の直線折りでは、その直線上の紙を同じ向き・同じ角度にしか折れないためです。
+
+詳細は `specification.md` の 3.5 を参照してください。
 
 #### 一意性の検算
 
