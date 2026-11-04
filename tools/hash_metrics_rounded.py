@@ -29,7 +29,7 @@ def main() -> None:
         trees = fifth.enumerate_spanning_trees(edges, len(faces))
         items = []
         for tree, polys in fifth.iter_unique_nets(v, faces, trees, normals):
-            m = fifth.net_metrics(polys, tree, v, shared_of)
+            m = fifth.net_metrics(polys, tree, v, faces, normals, shared_of)
             items.append(
                 (
                     round(m.bounding_box_area, 9),

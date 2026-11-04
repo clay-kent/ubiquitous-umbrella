@@ -28,7 +28,9 @@ def main():
         nets = list(fifth.iter_unique_nets(vertices, faces, trees, normals))
         shared_of = fifth.build_shared_of(faces)
         scored = [
-            fifth.net_metrics(polys, tree, vertices, shared_of).bounding_box_area
+            fifth.net_metrics(
+                polys, tree, vertices, faces, normals, shared_of
+            ).bounding_box_area
             for tree, polys in nets
         ]
         scored.sort()

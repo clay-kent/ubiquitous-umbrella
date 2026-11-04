@@ -19,7 +19,7 @@ def main():
     for tree, polys in fifth.iter_unique_nets(
         v, faces, fifth.enumerate_spanning_trees(edges, len(faces)), normals
     ):
-        m = fifth.net_metrics(polys, tree, v, shared_of)
+        m = fifth.net_metrics(polys, tree, v, faces, normals, shared_of)
         recs.append((m.bounding_box_area, tree))
     # 列挙順（そのまま）
     print("enumeration order (area, first 6):")

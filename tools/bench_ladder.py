@@ -136,7 +136,9 @@ def bench_solid(name, vertices, faces, timeout):
     if nets:
         shared_of = fifth.build_shared_of(faces)
         scored = [
-            fifth.net_metrics(polys, tree, vertices, shared_of).bounding_box_area
+            fifth.net_metrics(
+                polys, tree, vertices, faces, normals, shared_of
+            ).bounding_box_area
             for tree, polys in nets
         ]
         i = int(np.argmin(scored))

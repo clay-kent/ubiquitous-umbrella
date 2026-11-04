@@ -17,9 +17,9 @@ import fifth
 import make_nets
 
 
-def metrics_of(v, f, normals, shared_of, nets):
+def metrics_of(v, faces, normals, shared_of, nets):
     return [
-        fifth.net_metrics(polys, tree, v, shared_of).bounding_box_area
+        fifth.net_metrics(polys, tree, v, faces, normals, shared_of).bounding_box_area
         for tree, polys in nets
     ]
 
@@ -42,9 +42,10 @@ def main():
                 v, faces, fifth.enumerate_spanning_trees(edges, len(faces)), normals
             )
         )
-        areas = sorted(metrics_of(v, f, normals, shared_of, nets))
+        areas = sorted(metrics_of(v, faces, normals, shared_of, nets))
         perims = sorted(
-            fifth.net_metrics(p, t, v, shared_of).perimeter for t, p in nets
+            fifth.net_metrics(p, t, v, faces, normals, shared_of).perimeter
+            for t, p in nets
         )
         print(
             f"{name:8s} unique={len(nets):5d} "
