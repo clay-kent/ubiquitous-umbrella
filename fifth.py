@@ -613,12 +613,75 @@ class NetMetrics(NamedTuple):
     bounding_box_height: float
     bounding_box_area: float
     perimeter: float
+    fold_count: int
+
+
+def _fold_count(
+    polys: list[Polygon],
+    tree_edges: list[tuple[int, int]],
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    normals: list[np.ndarray],
+    shared_of: dict[tuple[int, int], tuple[int, int]],
+) -> int:
+    """折る回数 = 同じ直線上で同じ折り方の折り曲げ軸をまとめた本数。
+
+    同じ直線上に並んでいても、山折りと谷折り（折り角の符号）や折り角の
+    大きさが違えば 1 回では折れないので、別の折り操作として数える
+    （仕様 3.5）。
+
+    各ポリゴンの頂点は ``faces[i]`` と同じ順に並んでいるので、共有辺の
+    3D 頂点インデックスからそのまま 2D 座標を引ける。
+    """
+    # 直線の係数を展開図の大きさで正規化してから丸める。こうしないと
+    # 立体を拡大・縮小したときに値が変わる（_fold_axis_2d と同じ方針）。
+    extent = max(
+        max(p.bounds[2] - p.bounds[0], p.bounds[3] - p.bounds[1]) for p in polys
+    )
+    extent = extent or 1.0
+
+    pos_in_face = [{vertex: k for k, vertex in enumerate(face)} for face in faces]
+    coords = [list(poly.exterior.coords) for poly in polys]
+
+    folds: set[tuple[float, float, float, float]] = set()
+    for u, v in tree_edges:
+        a, b = shared_of[(u, v)]
+        index = pos_in_face[u]
+        p0 = coords[u][index[a]]
+        p1 = coords[u][index[b]]
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        norm = math.hypot(dx, dy)
+        # 法線 (nx, ny) と原点からの符号付き距離 offset で直線を表す。
+        nx, ny = -dy / norm, dx / norm
+        offset = nx * p0[0] + ny * p0[1]
+        # 同じ直線が向きの違いで別物にならないよう、法線の向きを揃える。
+        if abs(nx) > 1e-9:
+            if nx < 0.0:
+                nx, ny, offset = -nx, -ny, -offset
+        elif ny < 0.0:
+            nx, ny, offset = -nx, -ny, -offset
+        # 折り角 = 180 − 二面角。正なら谷折り、負なら山折り。
+        # 角度は 1e-6 度までで丸める（9 桁だと計算経路の差が残り、
+        # 同じ折り方の軸が別扱いになりうる）。
+        fold_angle = 180.0 - _dihedral_deg(vertices, faces, normals, u, v)
+        folds.add(
+            (
+                round(nx, EDGE_LEN_DECIMALS),
+                round(ny, EDGE_LEN_DECIMALS),
+                round(offset / extent, EDGE_LEN_DECIMALS),
+                round(fold_angle, 6),
+            )
+        )
+    return len(folds)
 
 
 def net_metrics(
     polys: list[Polygon],
     tree_edges: list[tuple[int, int]],
     vertices: np.ndarray,
+    faces: list[list[int]],
+    normals: list[np.ndarray],
     shared_of: dict[tuple[int, int], tuple[int, int]],
 ) -> NetMetrics:
     """展開図の評価指標を求める。
@@ -628,6 +691,9 @@ def net_metrics(
     展開図の外周は「折ったときに消える内側の棱」だけ短い。
     したがって外接矩形の周長 ``2*(w+h)`` は外周長ではない
     （L 字型の展開図では外接矩形の空这部分だけ周を含む）。
+
+    **折る回数 = 同じ直線上で同じ折り方の折り曲げ軸をまとめた本数**（仕様 3.5）。
+    山折りと谷折り、折り角の大きさが違う軸は別の操作として数える。
 
     ここが指標の**唯一の定義**。API と CLI はどちらもこれを呼ぶ。
     """
@@ -649,7 +715,25 @@ def net_metrics(
         bounding_box_height=float(bbox_h),
         bounding_box_area=float(bbox_w * bbox_h),
         perimeter=float(sum(p.length for p in polys) - 2.0 * glued),
+        fold_count=_fold_count(
+            polys, tree_edges, vertices, faces, normals, shared_of
+        ),
     )
+
+
+def metric_sort_key(metrics: NetMetrics, sort_by: str) -> float:
+    """``sort_by`` に対応する並べ替えキー。昇順が「良い順」。
+
+    どの指標で並べるかは API と CLI で同じでなければならないので、
+    ここに一本化する。
+    """
+    if sort_by == "area":
+        return metrics.bounding_box_area
+    if sort_by == "perimeter":
+        return metrics.perimeter
+    if sort_by == "folds":
+        return float(metrics.fold_count)
+    raise ValueError(f"未知の sort_by: {sort_by}")
 
 
 def _face_area_3d(vertices: np.ndarray, face: list[int]) -> float:

@@ -272,6 +272,7 @@
       "width": 6.0
      },
      "bounding_box_area": 30.0,
+     "fold_count": 5,
      "perimeter": 22.0
     },
     "net_id": 1.0
@@ -547,6 +548,7 @@
       "width": 6.0
      },
      "bounding_box_area": 30.0,
+     "fold_count": 5,
      "perimeter": 22.0
     },
     "net_id": 2.0
@@ -822,6 +824,7 @@
       "width": 6.0
      },
      "bounding_box_area": 30.0,
+     "fold_count": 5,
      "perimeter": 22.0
     },
     "net_id": 3.0
@@ -1122,6 +1125,7 @@
       "width": 5.0
      },
      "bounding_box_area": 10.0,
+     "fold_count": 5,
      "perimeter": 14.0
     },
     "net_id": 1.0
@@ -1397,6 +1401,7 @@
       "width": 3.0
      },
      "bounding_box_area": 12.0,
+     "fold_count": 5,
      "perimeter": 14.0
     },
     "net_id": 2.0
@@ -1672,6 +1677,7 @@
       "width": 3.0
      },
      "bounding_box_area": 12.0,
+     "fold_count": 5,
      "perimeter": 14.0
     },
     "net_id": 3.0
@@ -1972,6 +1978,7 @@
       "width": 6.656854249
      },
      "bounding_box_area": 16.071067812,
+     "fold_count": 5,
      "perimeter": 18.142135624
     },
     "net_id": 1.0
@@ -2247,6 +2254,7 @@
       "width": 4.828427125
      },
      "bounding_box_area": 16.485281374,
+     "fold_count": 5,
      "perimeter": 16.485281374
     },
     "net_id": 2.0
@@ -2522,6 +2530,7 @@
       "width": 4.828427125
      },
      "bounding_box_area": 16.485281374,
+     "fold_count": 5,
      "perimeter": 16.485281374
     },
     "net_id": 3.0
@@ -2759,6 +2768,7 @@
       "width": 3.863703305
      },
      "bounding_box_area": 10.92820323,
+     "fold_count": 4,
      "perimeter": 11.313708499
     },
     "net_id": 1.0
@@ -2971,6 +2981,7 @@
       "width": 3.863703305
      },
      "bounding_box_area": 14.92820323,
+     "fold_count": 4,
      "perimeter": 11.313708499
     },
     "net_id": 2.0
@@ -3183,6 +3194,7 @@
       "width": 3.863703305
      },
      "bounding_box_area": 10.92820323,
+     "fold_count": 4,
      "perimeter": 11.313708499
     },
     "net_id": 3.0
@@ -3372,6 +3384,7 @@
       "width": 7.071067812
      },
      "bounding_box_area": 17.320508076,
+     "fold_count": 3,
      "perimeter": 16.970562748
     },
     "net_id": 1.0
@@ -3537,6 +3550,7 @@
       "width": 5.656854249
      },
      "bounding_box_area": 27.712812921,
+     "fold_count": 3,
      "perimeter": 16.970562748
     },
     "net_id": 2.0

@@ -6,6 +6,9 @@ PR2 着手前の応答を golden として保存し、**正規化してから**�
 
 ⚠️ 生の JSON 文字列は比較しない。float の repr や dict の挿入順は
 意味を変えずに変動するので、バイト一致は偽の失敗を生む。
+
+※ 指標 ``metrics.fold_count`` は仕様追加に伴い golden にも同じ値を追記した。
+   それ以外の値（特に ``fold_axis_*`` / ``parent_face_id``）は PR2 着手前のまま。
 """
 
 import json

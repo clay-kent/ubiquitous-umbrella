@@ -140,7 +140,9 @@ class SolidRequest(BaseModel):
     top_n: int = Field(
         1, ge=1, le=MAX_TOP_N, description="返す展開図の数。評価指標の良い順に n 個。"
     )
-    sort_by: Literal["area", "perimeter"] = Field("area", description="並べ替えの基準")
+    sort_by: Literal["area", "perimeter", "folds"] = Field(
+        "area", description="並べ替えの基準（area / perimeter / folds）"
+    )
 
 
 def _face_geometry(
@@ -264,23 +266,19 @@ def calculate_nets(req: SolidRequest) -> dict[str, object]:
             "bounding_box": {"width": m.bounding_box_width, "height": m.bounding_box_height},
             "bounding_box_area": m.bounding_box_area,
             "perimeter": m.perimeter,
+            "fold_count": m.fold_count,
         }
 
     # 指標の計算は fifth.net_metrics に一本化した。ここは JSON の形にするだけ。
     scored = [
         (
-            fifth.net_metrics(polys, tree, vertices, shared_of),
+            fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of),
             tree,
             polys,
         )
         for tree, polys in unique
     ]
-    key = (
-        (lambda s: s[0].bounding_box_area)
-        if req.sort_by == "area"
-        else (lambda s: s[0].perimeter)
-    )
-    scored.sort(key=key)
+    scored.sort(key=lambda s: fifth.metric_sort_key(s[0], req.sort_by))
 
     selected = []
     for i, (metrics, tree, polys) in enumerate(scored[: req.top_n]):

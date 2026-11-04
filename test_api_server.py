@@ -268,6 +268,28 @@ def test_sort_by_perimeter_is_ascending():
     assert perims == sorted(perims)
 
 
+def test_sort_by_folds_is_ascending():
+    """立方体の 11 種はどれも折る回数 5 なので、並べ替えても値は変わらない。"""
+    r = post(cube_body(), top_n=11, sort_by="folds")
+    data = r.json()
+    folds = [net["metrics"]["fold_count"] for net in data["nets"]]
+    assert folds == sorted(folds) == [5] * 11
+    assert data["sort_by"] == "folds"
+
+
+def test_sort_by_folds_puts_the_fewest_folds_first():
+    """L 字柱には 6 回で折れる展開図と 7 回のものがあり、6 回が先に来る。"""
+    data = l_shape_data(1, sort_by="folds")
+    assert data["nets"][0]["metrics"]["fold_count"] == 6
+
+
+def test_fold_count_is_at_most_face_count_minus_one():
+    data = post(cube_body(), top_n=11).json()
+    face_count = data["solid"]["face_count"]
+    for net in data["nets"]:
+        assert 1 <= net["metrics"]["fold_count"] <= face_count - 1
+
+
 def test_sort_by_area_and_perimeter_can_pick_different_nets():
     """評価指標ごとに「最良」の意味が異なる（立方体の最小外接矩形面積と最小外周長は別物）。"""
     by_area = post(cube_body(), top_n=11, sort_by="area").json()["nets"]
@@ -310,7 +332,9 @@ def test_response_envelope():
     assert data["solid"]["total_area"] == pytest.approx(6.0)
     for net in data["nets"]:
         assert set(net) == {"net_id", "metrics", "faces"}
-        assert set(net["metrics"]) == {"bounding_box", "bounding_box_area", "perimeter"}
+        assert set(net["metrics"]) == {
+            "bounding_box", "bounding_box_area", "perimeter", "fold_count"
+        }
         assert set(net["metrics"]["bounding_box"]) == {"width", "height"}
 
 
@@ -510,6 +534,7 @@ def test_metrics_are_consistent_with_the_returned_geometry():
         assert net["metrics"]["bounding_box"]["height"] == pytest.approx(h)
         assert net["metrics"]["bounding_box_area"] == pytest.approx(w * h)
         assert net["metrics"]["perimeter"] > 0.0
+        assert net["metrics"]["fold_count"] == 5
 
 
 # --------------------------------------------------------------------------
@@ -837,7 +862,7 @@ def test_api_and_cli_compute_the_same_perimeter():
     scored = sorted(
         (
             (
-                fifth.net_metrics(polys, tree, vertices, shared_of),
+                fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of),
                 polys,
             )
             for tree, polys in nets

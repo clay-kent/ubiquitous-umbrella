@@ -4,6 +4,7 @@ import itertools
 import math
 import random
 import re
+from collections import Counter
 
 import networkx as nx
 import numpy as np
@@ -619,7 +620,7 @@ def test_perimeter_equals_face_sum_minus_folded_edges(builder):
             for a, b in [shared_of[(u, w)]]
         )
         assert glued > 0, "全域木なので折り曲げ軸が1本以上ある"
-        m = fifth.net_metrics(polys, tree, v, shared_of)
+        m = fifth.net_metrics(polys, tree, v, f, normals, shared_of)
         assert m.perimeter == pytest.approx(face_sum - 2.0 * glued, abs=1e-9)
 
 
@@ -636,7 +637,9 @@ def test_unit_cube_net_perimeter_is_14():
 
     assert len(nets) == 11
     for tree, polys in nets:
-        assert fifth.net_metrics(polys, tree, v, shared_of).perimeter == pytest.approx(14.0)
+        assert fifth.net_metrics(
+            polys, tree, v, f, normals, shared_of
+        ).perimeter == pytest.approx(14.0)
 
 
 def test_perimeter_is_not_the_bounding_box_perimeter():
@@ -653,7 +656,7 @@ def test_perimeter_is_not_the_bounding_box_perimeter():
 
     strictly_bigger = 0
     for tree, polys in nets:
-        m = fifth.net_metrics(polys, tree, v, shared_of)
+        m = fifth.net_metrics(polys, tree, v, f, normals, shared_of)
         old = _old_bbox_perimeter(polys)
         assert m.perimeter >= old - 1e-9  # 多角形の周長は外接矩形の周長以上
         if m.perimeter > old + 1e-9:
@@ -669,10 +672,59 @@ def test_net_metrics_bbox_area_matches_width_times_height():
     shared_of = fifth.build_shared_of(f)
     tree, polys = _unique_nets(v, f)[0]
 
-    m = fifth.net_metrics(polys, tree, v, shared_of)
+    m = fifth.net_metrics(polys, tree, v, f, normals, shared_of)
     assert m.bounding_box_area == pytest.approx(
         m.bounding_box_width * m.bounding_box_height
     )
+
+
+def test_fold_count_is_face_count_minus_one_without_collinear_axes():
+    """一直線上に折り曲げ軸が並ばない立体では、折る回数 = 面数 − 1。"""
+    v, f = cube()
+    normals = fifth.compute_normals(v, f)
+    shared_of = fifth.build_shared_of(f)
+    nets = _unique_nets(v, f)
+
+    assert len(nets) == 11
+    for tree, polys in nets:
+        assert fifth.net_metrics(
+            polys, tree, v, f, normals, shared_of
+        ).fold_count == len(f) - 1
+
+
+def test_fold_count_merges_collinear_fold_axes():
+    """L 字柱には一直線に並ぶ折り曲げ軸を持つ展開図があり、面数−1 より小さくなる。
+
+    同じ直線でも山折りと谷折り（折り角の符号）が違えば別の折り操作になる。
+    角度を無視して直線だけでまとめると 6 回の展開図は 228 枚になるが、
+    区別すると 52 枚に減る。その差がこのテストの主張。
+    """
+    v, f = l_shape()
+    normals = fifth.compute_normals(v, f)
+    shared_of = fifth.build_shared_of(f)
+    nets = _unique_nets(v, f)
+
+    counts = Counter(
+        fifth.net_metrics(polys, tree, v, f, normals, shared_of).fold_count
+        for tree, polys in nets
+    )
+    assert counts == {len(f) - 2: 52, len(f) - 1: 1464}
+
+
+@pytest.mark.parametrize("scale", [1.0, 1e-6, 1e-9])
+def test_fold_count_is_scale_invariant(scale):
+    """折る回数は直線の本数なので、立体を縮めても変わらない。"""
+    v, f = cube()
+    v = v * scale
+    normals = fifth.compute_normals(v, f)
+    shared_of = fifth.build_shared_of(f)
+    nets = _unique_nets(v, f)
+
+    counts = {
+        fifth.net_metrics(polys, tree, v, f, normals, shared_of).fold_count
+        for tree, polys in nets
+    }
+    assert counts == {5}
 
 
 # --------------------------------------------------------------------------

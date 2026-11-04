@@ -179,7 +179,7 @@ def main() -> None:
     parser.add_argument(
         "--sort-by",
         default="area",
-        choices=["area", "perimeter"],
+        choices=["area", "perimeter", "folds"],
         help="並べ替えの基準（既定: area）",
     )
     parser.add_argument(
@@ -202,14 +202,9 @@ def main() -> None:
     metrics = []
     shared_of = fifth.build_shared_of(faces)
     for tree, polys in nets:
-        m = fifth.net_metrics(polys, tree, vertices, shared_of)
+        m = fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of)
         metrics.append((m, polys))
-    key = (
-        (lambda s: s[0].bounding_box_area)
-        if args.sort_by == "area"
-        else (lambda s: s[0].perimeter)
-    )
-    metrics.sort(key=key)
+    metrics.sort(key=lambda s: fifth.metric_sort_key(s[0], args.sort_by))
 
     if args.top_n > 0:
         metrics = metrics[: args.top_n]
@@ -223,7 +218,8 @@ def main() -> None:
         plot_net(polys, f"{args.solid} net {idx}  area={m.bounding_box_area:g}", filename)
         print(
             f"Saved: {filename}  "
-            f"(外接矩形面積 {m.bounding_box_area:g}, 外周長 {m.perimeter:g})"
+            f"(外接矩形面積 {m.bounding_box_area:g}, "
+            f"外周長 {m.perimeter:g}, 折る回数 {m.fold_count})"
         )
 
 
