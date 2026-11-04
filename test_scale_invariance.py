@@ -17,6 +17,7 @@ import pytest
 
 import fifth
 import make_nets
+import net_test_cache
 
 # 軽い立体も重い立体も、実測では 5 スケールすべてで一致した。
 # 1e-10 を超えたら「検証していない領域」ではなく、確実に壊れている。
@@ -56,10 +57,7 @@ def _unique_count(builder, scale):
     v, f = builder()
     v = v.astype(float) * scale
     faces = fifth.orient_faces_outward(v, f)
-    normals = fifth.compute_normals(v, faces)
-    edges = fifth.build_adjacency_graph(faces)
-    trees = fifth.enumerate_spanning_trees(edges, len(faces))
-    return len(list(fifth.iter_unique_nets(v, faces, trees, normals)))
+    return len(net_test_cache.unique_nets(v, faces))
 
 
 @pytest.mark.parametrize(
@@ -130,12 +128,9 @@ def _fold_axes(builder, scale):
     v, f = builder()
     v = v.astype(float) * scale
     faces = fifth.orient_faces_outward(v, f)
-    normals = fifth.compute_normals(v, faces)
-    edges = fifth.build_adjacency_graph(faces)
-    trees = fifth.enumerate_spanning_trees(edges, len(faces))
 
     axes = []
-    for tree, polys in fifth.iter_unique_nets(v, faces, trees, normals):
+    for tree, polys in net_test_cache.unique_nets(v, faces):
         ext = max(
             max(p.bounds[2] - p.bounds[0], p.bounds[3] - p.bounds[1]) for p in polys
         )

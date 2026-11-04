@@ -11,6 +11,7 @@ import pytest
 from shapely.geometry import Polygon
 
 import fifth
+import net_test_cache
 
 # --------------------------------------------------------------------------
 # テスト用の立体
@@ -607,9 +608,7 @@ def test_perimeter_equals_face_sum_minus_folded_edges(builder):
     v, f = builder()
     normals = fifth.compute_normals(v, f)
     shared_of = fifth.build_shared_of(f)
-    edges = fifth.build_adjacency_graph(f)
-    trees = fifth.enumerate_spanning_trees(edges, len(f))
-    nets = list(fifth.iter_unique_nets(v, f, trees, normals))
+    nets = _unique_nets(v, f)
     assert nets, "展開図が1つも無いと空振りになる"
 
     for tree, polys in nets:
@@ -633,8 +632,7 @@ def test_unit_cube_net_perimeter_is_14():
     v, f = cube()
     normals = fifth.compute_normals(v, f)
     shared_of = fifth.build_shared_of(f)
-    trees = fifth.enumerate_spanning_trees(fifth.build_adjacency_graph(f), len(f))
-    nets = list(fifth.iter_unique_nets(v, f, trees, normals))
+    nets = _unique_nets(v, f)
 
     assert len(nets) == 11
     for tree, polys in nets:
@@ -650,9 +648,7 @@ def test_perimeter_is_not_the_bounding_box_perimeter():
     v, f = l_shape()
     normals = fifth.compute_normals(v, f)
     shared_of = fifth.build_shared_of(f)
-    edges = fifth.build_adjacency_graph(f)
-    trees = fifth.enumerate_spanning_trees(edges, len(f))
-    nets = list(fifth.iter_unique_nets(v, f, trees, normals))
+    nets = _unique_nets(v, f)
     assert nets, "展開図が1つも無いと空振りになる"
 
     strictly_bigger = 0
@@ -671,9 +667,7 @@ def test_net_metrics_bbox_area_matches_width_times_height():
     v, f = cube()
     normals = fifth.compute_normals(v, f)
     shared_of = fifth.build_shared_of(f)
-    edges = fifth.build_adjacency_graph(f)
-    trees = fifth.enumerate_spanning_trees(edges, len(f))
-    tree, polys = next(iter(fifth.iter_unique_nets(v, f, trees, normals)))
+    tree, polys = _unique_nets(v, f)[0]
 
     m = fifth.net_metrics(polys, tree, v, shared_of)
     assert m.bounding_box_area == pytest.approx(
@@ -687,10 +681,13 @@ def test_net_metrics_bbox_area_matches_width_times_height():
 
 
 def _unique_nets(v, f):
-    normals = fifth.compute_normals(v, f)
-    edges = fifth.build_adjacency_graph(f)
-    trees = fifth.enumerate_spanning_trees(edges, len(f))
-    return list(fifth.iter_unique_nets(v, f, trees, normals))
+    """一意な展開図。同じ立体を何度も列挙しないよう共有キャッシュ経由で取る。
+
+    ``test_budget_headroom_is_large`` と
+    ``test_errors_inside_the_tree_loop_propagate`` だけは、内部関数を
+    差し替えて挙動を見るためキャッシュを使わない。
+    """
+    return net_test_cache.unique_nets(v, f)
 
 
 @pytest.mark.parametrize(

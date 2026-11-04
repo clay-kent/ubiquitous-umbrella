@@ -18,6 +18,7 @@
 ├── test_fifth.py                # コア部分のユニットテスト
 ├── test_api_server.py           # API のユニット・結合テスト
 ├── test_unique_nets_geometry.py # 一意性の判定を平面図形の合同で独立に検算するテスト
+├── net_test_cache.py            # テスト専用。重い展開図計算をファイル間で共有する
 ├── specification.md             # 要求仕様・JSON スキーマ
 ├── pyproject.toml               # 依存関係定義
 ├── requirements.txt             # pip 向けの依存関係一覧

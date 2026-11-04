@@ -1,5 +1,6 @@
 """api_server.py（POST /api/net/calculate）のユニット・結合テスト。"""
 
+import functools
 import json
 import math
 
@@ -109,13 +110,59 @@ def octahedron_body():
     return {"vertices": v, "faces": f}
 
 
+_OK_RESPONSES: dict[tuple[object, ...], object] = {}
+
+
 def post(body, headers=None, content=None, **params):
-    """本体に solidify パラメータを載せて POST する。"""
+    """本体に solidify パラメータを載せて POST する。
+
+    同じリクエストの 200 応答は使い回す。1 回の POST は全域木の列挙
+    （L 字柱なら 8,100 本）を含むので、立方体や L 字柱を何度も叩く
+    テストで同じ計算を繰り返さないため。422 は列挙前に返るものが大半で
+    安いのでキャッシュしない（モンキーパッチを見逃さないため）。
+    """
+    headers = headers or {}
     if content is not None:
-        return client.post(URL, content=content, headers=headers or {})
-    payload = dict(body or {})
-    payload.update(params)
-    return client.post(URL, json=payload, headers=headers or {})
+        key: tuple[object, ...] = ("content", content, tuple(sorted(headers.items())))
+    else:
+        payload = dict(body or {})
+        payload.update(params)
+        key = (
+            "json",
+            json.dumps(payload, sort_keys=True),
+            tuple(sorted(headers.items())),
+        )
+
+    cached = _OK_RESPONSES.get(key)
+    if cached is not None:
+        return cached
+
+    if content is not None:
+        response = client.post(URL, content=content, headers=headers)
+    else:
+        response = client.post(URL, json=payload, headers=headers)
+    if response.status_code == 200:
+        _OK_RESPONSES[key] = response
+    return response
+
+
+@functools.cache
+def _l_shape_all(sort_by: str) -> dict:
+    """L 字柱の全展開図（上位 400 件）を 1 回だけ取得して JSON を保持する。
+
+    L 字柱は 1 リクエスト 9 秒前後かかる。top_n や用途ごとに叩き直さず、
+    必要な件数だけ切り出して使う。
+    """
+    response = post(l_shape_body(), top_n=400, sort_by=sort_by)
+    assert response.status_code == 200, response.text[:400]
+    return response.json()
+
+
+def l_shape_data(top_n: int, sort_by: str = "area") -> dict:
+    """L 字柱の応答を、共有済みの全件レスポンスから切り出して返す。"""
+    data = _l_shape_all(sort_by)
+    nets = data["nets"][:top_n]
+    return {**data, "returned": len(nets), "nets": nets}
 
 
 # --------------------------------------------------------------------------
@@ -166,9 +213,7 @@ def test_total_unique_nets(name, builder, expected):
 
 def test_non_convex_solid_is_accepted():
     """凹角を持つ L 字柱も拒否せず、上位n個を返す。"""
-    r = post(l_shape_body())
-    assert r.status_code == 200, r.text
-    data = r.json()
+    data = l_shape_data(1)
     assert data["total_unique_nets"] == 1516
     assert data["returned"] == 1
     assert len(data["nets"][0]["faces"]) == 8
@@ -327,7 +372,7 @@ def test_reflex_edge_reports_270_degrees():
     凹角棱は 1 本だけで、どの展開図にも含まれるわけではないので、
     多くの展開図をまとめて見てその値が出ることを確認する。
     """
-    data = post(l_shape_body(), top_n=400).json()
+    data = l_shape_data(400)
     seen = set()
     for net in data["nets"]:
         for f in net["faces"]:
@@ -409,13 +454,19 @@ def _polygon_area(coords):
 
 def test_net_preserves_every_face_area():
     """展開しても各面の面積は変わらない。"""
-    for builder in (cube_body, tetrahedron_body, lambda: prism_body(5), l_shape_body):
+    for builder in (cube_body, tetrahedron_body, lambda: prism_body(5)):
         body = builder()
-        data = post(body, top_n=3).json()
-        for net in data["nets"]:
-            for f in net["faces"]:
-                expected = _face_area_3d(body, f["face_id"])
-                assert _polygon_area(f["vertices_2d"]) == pytest.approx(expected, abs=1e-6)
+        _assert_face_areas(body, post(body, top_n=3).json())
+
+    # L 字柱は 1 リクエストが重いので、共有済みの応答を使う。
+    _assert_face_areas(l_shape_body(), l_shape_data(3))
+
+
+def _assert_face_areas(body, data):
+    for net in data["nets"]:
+        for f in net["faces"]:
+            expected = _face_area_3d(body, f["face_id"])
+            assert _polygon_area(f["vertices_2d"]) == pytest.approx(expected, abs=1e-6)
 
 
 def _face_area_3d(body, face_id):
@@ -432,15 +483,21 @@ def _face_area_3d(body, face_id):
 
 
 def test_net_faces_do_not_overlap():
+    for builder in (cube_body, lambda: prism_body(4)):
+        _assert_no_overlap(post(builder(), top_n=3).json())
+
+    # L 字柱は 1 リクエストが重いので、共有済みの応答を使う。
+    _assert_no_overlap(l_shape_data(3))
+
+
+def _assert_no_overlap(data):
     from shapely.geometry import Polygon
 
-    for builder in (cube_body, lambda: prism_body(4), l_shape_body):
-        data = post(builder(), top_n=3).json()
-        for net in data["nets"]:
-            polys = [Polygon(f["vertices_2d"]) for f in net["faces"]]
-            for i in range(len(polys)):
-                for j in range(i + 1, len(polys)):
-                    assert polys[i].intersection(polys[j]).area == pytest.approx(0.0, abs=1e-6)
+    for net in data["nets"]:
+        polys = [Polygon(f["vertices_2d"]) for f in net["faces"]]
+        for i in range(len(polys)):
+            for j in range(i + 1, len(polys)):
+                assert polys[i].intersection(polys[j]).area == pytest.approx(0.0, abs=1e-6)
 
 
 def test_metrics_are_consistent_with_the_returned_geometry():
@@ -797,14 +854,7 @@ def test_perimeter_is_not_the_bounding_box_perimeter():
 
     外周長は「全面の周長合計 − 2×折り曲げ軸」。外接矩形の周長とは別物。
     """
-    profile = [(0, 0), (3, 0), (3, 1), (1, 1), (1, 2), (0, 2)]
-    vertices = [[x, y, float(z)] for z in (0.0, 1.0) for x, y in profile]
-    faces = [[5, 4, 3, 2, 1, 0], list(range(6, 12))]
-    faces += [[i, (i + 1) % 6, 6 + (i + 1) % 6, 6 + i] for i in range(6)]
-
-    r = client.post(URL, json={"vertices": vertices, "faces": faces, "top_n": 1})
-    assert r.status_code == 200, r.text[:400]
-    m = r.json()["nets"][0]["metrics"]
+    m = l_shape_data(1)["nets"][0]["metrics"]
     bbox_perimeter = 2.0 * (m["bounding_box"]["width"] + m["bounding_box"]["height"])
     assert m["perimeter"] != pytest.approx(bbox_perimeter, abs=1e-9)
 
