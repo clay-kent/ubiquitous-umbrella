@@ -782,35 +782,45 @@ def test_search_budget_exceeded_raises_a_named_solid_error():
     assert ei.value.code == "search_budget_exceeded"
 
 
-def test_budget_headroom_is_large():
+@pytest.mark.parametrize(
+    "builder",
+    [
+        pytest.param(cube_b, id="cube"),
+        pytest.param(tetrahedron_b, id="tetra"),
+        pytest.param(prism4_b, id="prism4"),
+        pytest.param(prism5_b, id="prism5"),
+        pytest.param(l_shape_b, id="L-shape", marks=pytest.mark.slow),
+    ],
+)
+def test_budget_headroom_is_large(builder):
     """SEARCH_BUDGET は現実のプリセットに対して十分な余裕がある。
 
     余裕がなければ「到達しないから abort は安全」という前提が崩れる。
+    内部関数を差し替えて予算の最大値を測るので、共有キャッシュは使えない。
     """
-    for builder in (cube_b, tetrahedron_b, prism4_b, prism5_b, l_shape_b):
-        v, f = builder()
-        faces = fifth.orient_faces_outward(v, f)
-        normals = fifth.compute_normals(v, f)
-        trees = fifth.enumerate_spanning_trees(
-            fifth.build_adjacency_graph(faces), len(faces)
-        )
-        peak = {"v": 0}
+    v, f = builder()
+    faces = fifth.orient_faces_outward(v, f)
+    normals = fifth.compute_normals(v, f)
+    trees = fifth.enumerate_spanning_trees(
+        fifth.build_adjacency_graph(faces), len(faces)
+    )
+    peak = {"v": 0}
 
-        original = fifth._individualize_refine
+    original = fifth._individualize_refine
 
-        def counting(nxt, partner, flip, color, budget, _o=original):
-            try:
-                return _o(nxt, partner, flip, color, budget)
-            finally:
-                peak["v"] = max(peak["v"], budget[0])
-
-        fifth._individualize_refine = counting
+    def counting(nxt, partner, flip, color, budget, _o=original):
         try:
-            list(fifth.iter_unique_nets(v, faces, trees, normals))
+            return _o(nxt, partner, flip, color, budget)
         finally:
-            fifth._individualize_refine = original
+            peak["v"] = max(peak["v"], budget[0])
 
-        assert 0 < peak["v"] < fifth.SEARCH_BUDGET / 100, (builder, peak["v"])
+    fifth._individualize_refine = counting
+    try:
+        list(fifth.iter_unique_nets(v, faces, trees, normals))
+    finally:
+        fifth._individualize_refine = original
+
+    assert 0 < peak["v"] < fifth.SEARCH_BUDGET / 100, (builder, peak["v"])
 
 
 

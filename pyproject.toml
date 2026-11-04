@@ -25,8 +25,13 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+# 既定では `slow` を外す（pytest -q が数分かからないように）。
+#   通常        : pytest -q
+#   全部（CI）  : pytest -q -m ""
+#   重いものだけ: pytest -q -m slow
+addopts = "-m 'not slow'"
 markers = [
-    "slow: 数秒かかる重いケース。`-m 'not slow'` で除外できる",
+    "slow: 1 ケースで数秒かかる重い走査。`-m ''` で全部、`-m slow` でこれだけ実行できる",
 ]
 
 [tool.mypy]

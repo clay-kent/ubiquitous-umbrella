@@ -31,9 +31,10 @@ CASES = [
     pytest.param(lambda: make_nets.pyramid(4), 8, id="square_pyramid"),
     pytest.param(lambda: make_nets.pyramid(5), 15, id="pentagonal_pyramid"),
     # 以下の 2 つは最も重いケース（どちらも全域木 8100 本、実測 7〜9 秒）。
-    # 正規形の粒度が崩れると軽い立体のテストでは気づけないので、必ず含める。
-    pytest.param(make_nets.l_shape, 1516, id="L-shape"),
-    pytest.param(lambda: make_nets.prism(6), 354, id="hexagonal_prism"),
+    # 正規形の粒度が崩れると軽い立体のテストでは気づけないので、
+    # 既定では `slow` として除外し、CI の `pytest -m ""` で必ず回す。
+    pytest.param(make_nets.l_shape, 1516, id="L-shape", marks=pytest.mark.slow),
+    pytest.param(lambda: make_nets.prism(6), 354, id="hexagonal_prism", marks=pytest.mark.slow),
 ]
 
 

@@ -192,8 +192,13 @@ uvicorn api_server:app --reload
 `test_unique_nets_geometry.py` では、平面図形の合同（全頂点対の距離の多重集合）で一意数を数え直し、両者が一致することを確認しています。
 
 ```powershell
-pytest -q
+pytest -q                  # 通常（slow を除外）
+pytest -q -m ""            # 全部（CI 向け）
+pytest -q -m slow          # 重いケースだけ
+pytest -q --durations=10   # 遅いテストの内訳を見る
 ```
+
+L 字柱（1516 種）と 6 角柱（354 種）は全域木が 8,100 本あり、1 回の列挙に 7〜9 秒かかります。同じ立体を何度も列挙しないよう、テストは `net_test_cache.py` を経由して結果を共有します。`slow` を付けたケースだけが既定で除外されます。
 
 ---
 
