@@ -21,6 +21,16 @@ FACE_NORMAL_REL_TOL = 1e-12
 # 実測: 実重なりは最小 1.0、ダストは 1e-9 未満なので 9 桁の余裕がある。
 OVERLAP_AREA_REL_TOL = 1e-7
 
+# のりしろ（glue tab）の奥行き。貼り付ける辺の長さ L に対する比で決める。
+# 絶対長にすると立体を拡大・縮小しただけで形が変わり、同じ展開図とみなせなくなる。
+TAB_DEPTH_RATIO = 0.25
+
+# 台形の上辺をどれだけ内側へ逃がすか（奥行きに対する比）。
+# 1.0 で側面が 45 度になり、直角の頂点で隣り合うのりしろが重なりにくい。
+# 0.45L を上限にして、短い辺でも上辺が潰れないようにする。
+TAB_SIDE_SLANT = 1.0
+TAB_MAX_END_INSET_RATIO = 0.45
+
 # 個別化-細分の仕事量上限。これを超えると 422 で失敗させる。
 # 根拠（実測）: どのプリセットでも最大でも 126 程度（prism5）。最も重い
 # lshape でも数千程度なので 1500 倍以上の余裕があり、実入力では到達しない。
@@ -1618,6 +1628,258 @@ def _fold_axis_2d(
     return [
         [float(shared[0][0]), float(shared[0][1])],
         [float(shared[1][0]), float(shared[1][1])],
+    ]
+
+
+class GlueTab(NamedTuple):
+    """展開図の外周に付けるのりしろ 1 枚分。
+
+    のりしろは「展開図では直接つながっていないが、立体にすると接する辺」
+    （= 全域木に含まれない共有辺）の**片側だけ**に付ける。両側に付けると
+    貼り合わせが二重になり、どちらにも付けないと閉じない。
+
+    ``vertices_2d`` は ``[貼り付け辺の始点, 終点, 外側の終点側, 外側の始点側]``
+    の順（台形）。最初の 2 点が面の外周と共有する辺になる。
+    """
+
+    face_id: int
+    neighbor_face_id: int
+    edge_3d: list[list[float]]
+    edge_2d: list[list[float]]
+    vertices_2d: list[list[float]]
+
+
+class _TabCandidate(NamedTuple):
+    """1 本の共有辺について、片側の面に付けた場合ののりしろ。"""
+
+    face_id: int
+    neighbor_face_id: int
+    edge_3d: list[list[float]]
+    edge_2d: list[list[float]]
+    vertices_2d: list[list[float]]
+    polygon: Polygon
+
+
+def _tab_loop_coords(poly: Polygon) -> list[tuple[float, float]]:
+    """Polygon の外周を、閉じるための重複点を除いて返す。"""
+    x, y = poly.exterior.xy
+    return [(float(x[i]), float(y[i])) for i in range(len(x) - 1)]
+
+
+def _tab_signed_area(coords: list[tuple[float, float]]) -> float:
+    """外周の符号付き面積。正なら反時計回り（内側は進行方向の左）。"""
+    total = 0.0
+    for i, (x0, y0) in enumerate(coords):
+        x1, y1 = coords[(i + 1) % len(coords)]
+        total += x0 * y1 - x1 * y0
+    return 0.5 * total
+
+
+def _make_tab_candidate(
+    coords: list[tuple[float, float]],
+    signed_area: float,
+    face: list[int],
+    face_id: int,
+    neighbor_face_id: int,
+    a: int,
+    b: int,
+    vertices: np.ndarray,
+) -> _TabCandidate:
+    """共有辺 ``(a, b)`` を面 ``face_id`` 側に貼る場合の台形を作る。
+
+    ``coords`` は ``polys[face_id]`` の外周で、頂点の並びは ``face`` と同じ。
+    法線の向きは外周の符号付き面積から決める（面の内外を点内含判定で
+    調べないので、細い面や丸めの影響を受けない）。
+    """
+    n = len(face)
+    idx = -1
+    for i in range(n):
+        if {face[i], face[(i + 1) % n]} == {a, b}:
+            idx = i
+            break
+    if idx < 0:
+        # pair_to_edge は build_adjacency_with_edges の結果なので、
+        # ここに来るのは呼び出し側が面と辺の対応を壊したときだけ。
+        raise ValueError(
+            f"面{face_id} に辺({a}, {b}) が見つかりません（pair_to_edge が不正です）。"
+        )
+
+    p0x, p0y = coords[idx]
+    p1x, p1y = coords[(idx + 1) % n]
+    dx = p1x - p0x
+    dy = p1y - p0y
+    length = math.hypot(dx, dy)
+    if length <= 0.0:
+        raise ValueError(f"面{face_id} の辺({a}, {b}) の長さが 0 です。")
+    ux, uy = dx / length, dy / length
+
+    # CCW なら内側は進行方向の左なので、外側は右。CW ならその逆。
+    if signed_area >= 0.0:
+        ox, oy = uy, -ux
+    else:
+        ox, oy = -uy, ux
+
+    depth = TAB_DEPTH_RATIO * length
+    inset = min(TAB_SIDE_SLANT * depth, TAB_MAX_END_INSET_RATIO * length)
+
+    # 台形: 貼り付け辺 p0->p1 から外側へ depth 出し、上辺を左右に inset 逃がす。
+    q0x = p0x + ox * depth + ux * inset
+    q0y = p0y + oy * depth + uy * inset
+    q1x = p1x + ox * depth - ux * inset
+    q1y = p1y + oy * depth - uy * inset
+
+    verts = [
+        [p0x, p0y],
+        [p1x, p1y],
+        [q1x, q1y],
+        [q0x, q0y],
+    ]
+    ea, eb = face[idx], face[(idx + 1) % n]
+    return _TabCandidate(
+        face_id=face_id,
+        neighbor_face_id=neighbor_face_id,
+        edge_3d=[
+            [float(c) for c in vertices[ea]],
+            [float(c) for c in vertices[eb]],
+        ],
+        edge_2d=[[p0x, p0y], [p1x, p1y]],
+        vertices_2d=verts,
+        polygon=Polygon(verts),
+    )
+
+
+def _tab_overlap_area(a: Polygon, b: Polygon, scale: float) -> float:
+    """2 つのポリゴンの交差面積。浮動ノイズは 0 とみなす。"""
+    area = a.intersection(b).area
+    threshold = OVERLAP_AREA_REL_TOL * scale * scale
+    return float(area) if area > threshold else 0.0
+
+
+def _choose_tab_sides(
+    candidates: list[list[_TabCandidate]],
+    polys: list[Polygon],
+) -> list[_TabCandidate]:
+    """各共有辺について、重なりが小さくなる側を 1 つ選ぶ。
+
+    のりしろ同士・のりしろと面の重なり面積をコストにし、まず貪欲に決めて
+    から 1 枚ずつ反転して改善する。``candidates`` の各要素は必ず 2 枚
+    （両側）なので、結果は「各辺ちょうど 1 枚」を構造的に満たす。
+    """
+    if not candidates:
+        return []
+
+    extent = max(
+        max(p.bounds[2] - p.bounds[0], p.bounds[3] - p.bounds[1]) for p in polys
+    )
+    scale = extent or 1.0
+    unary = [
+        [
+            sum(_tab_overlap_area(c.polygon, poly, scale) for poly in polys)
+            for c in pair
+        ]
+        for pair in candidates
+    ]
+
+    chosen: list[_TabCandidate] = []
+    chosen_idx: list[int] = []
+    for i, pair in enumerate(candidates):
+        costs = [
+            unary[i][k]
+            + sum(
+                _tab_overlap_area(pair[k].polygon, chosen[j].polygon, scale)
+                for j in range(len(chosen))
+            )
+            for k in range(len(pair))
+        ]
+        # 同コストなら先頭（面番号の小さい側）を選ぶ。出力を決定的にするため。
+        k = min(range(len(pair)), key=lambda k_: (costs[k_], k_))
+        chosen.append(pair[k])
+        chosen_idx.append(k)
+
+    # 貪欲の後ろで選んだ側が、後から来たのりしろと重なることがある。
+    # 1 枚ずつ反転してコストが下がる限り繰り返す（局所最適）。
+    for _ in range(8):
+        improved = False
+        for i, pair in enumerate(candidates):
+            if len(pair) < 2:
+                continue
+            other_unary = [
+                sum(
+                    _tab_overlap_area(pair[k].polygon, chosen[j].polygon, scale)
+                    for j in range(len(chosen))
+                    if j != i
+                )
+                for k in range(len(pair))
+            ]
+            costs = [unary[i][k] + other_unary[k] for k in range(len(pair))]
+            k = min(range(len(pair)), key=lambda k_: (costs[k_], k_))
+            if costs[k] < costs[chosen_idx[i]]:
+                chosen[i] = pair[k]
+                chosen_idx[i] = k
+                improved = True
+        if not improved:
+            break
+    return chosen
+
+
+def glue_tabs(
+    polys: list[Polygon],
+    faces: list[list[int]],
+    tree_edges: list[tuple[int, int]],
+    pair_to_edge: dict[frozenset[int], tuple[int, int]],
+    vertices: np.ndarray,
+) -> list[GlueTab]:
+    """展開図の「切れている辺」に、ちょうど片側ずつのりしろを付ける。
+
+    切れている辺とは、面グラフの隣接辺のうち全域木に含まれないもの
+    （= 展開図では直接つながっておらず、立体にすると接する辺）。
+    各辺について両面の候補を作り、重なりが小さい側を 1 つだけ選ぶので、
+    「両方に付く」「どちらにも付かない」は起こらない。
+
+    のりしろは面のポリゴンには含めない。したがって ``net_metrics`` の
+    外周長・外接矩形・折る回数は、のりしろを付ける前と同じ値になる
+    （仕様では折る回数からのりしろを無視する）。
+    """
+    n_faces = len(faces)
+    tree_pairs = {frozenset(edge) for edge in tree_edges}
+    cut_pairs = [pair for pair in pair_to_edge if pair not in tree_pairs]
+    # 面対の昇順に処理する。集合の反復順に依存せず、出力を決定的にする。
+    cut_pairs.sort(key=lambda pair: tuple(sorted(pair)))
+
+    coords = [_tab_loop_coords(poly) for poly in polys]
+    areas = [_tab_signed_area(loop) for loop in coords]
+
+    candidates: list[list[_TabCandidate]] = []
+    for pair in cut_pairs:
+        u, v = sorted(pair)
+        a, b = pair_to_edge[pair]
+        sides = []
+        for face_id, neighbor in ((u, v), (v, u)):
+            if face_id >= n_faces:
+                raise ValueError("面番号が面数以上です。")
+            sides.append(
+                _make_tab_candidate(
+                    coords[face_id],
+                    areas[face_id],
+                    faces[face_id],
+                    face_id,
+                    neighbor,
+                    a,
+                    b,
+                    vertices,
+                )
+            )
+        candidates.append(sides)
+
+    return [
+        GlueTab(
+            face_id=c.face_id,
+            neighbor_face_id=c.neighbor_face_id,
+            edge_3d=c.edge_3d,
+            edge_2d=c.edge_2d,
+            vertices_2d=c.vertices_2d,
+        )
+        for c in _choose_tab_sides(candidates, polys)
     ]
 
 

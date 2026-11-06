@@ -331,11 +331,15 @@ def test_response_envelope():
     assert data["solid"]["bounding_box"] == {"width": 1.0, "height": 1.0, "depth": 1.0}
     assert data["solid"]["total_area"] == pytest.approx(6.0)
     for net in data["nets"]:
-        assert set(net) == {"net_id", "metrics", "faces"}
+        assert set(net) == {"net_id", "metrics", "faces", "glue_tabs"}
         assert set(net["metrics"]) == {
             "bounding_box", "bounding_box_area", "perimeter", "fold_count"
         }
         assert set(net["metrics"]["bounding_box"]) == {"width", "height"}
+        assert all(
+            set(tab) == {"face_id", "neighbor_face_id", "edge_3d", "edge_2d", "vertices_2d"}
+            for tab in net["glue_tabs"]
+        )
 
 
 def test_each_face_reports_its_own_polygon_size():

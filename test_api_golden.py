@@ -26,9 +26,16 @@ GOLDEN = pathlib.Path(__file__).parent / "tests" / "api_golden_v2.json"
 
 
 def normalise(obj):
-    """dict を再帰的にソートし、float を9桁に丸めて比較可能にする。"""
+    """dict を再帰的にソートし、float を9桁に丸めて比較可能にする。
+
+    ``glue_tabs`` は後から追加したフィールドなので、PR2 着手前の golden には
+    存在しない。ここでは旧フィールドだけを突き合わせ、のりしろの正しさは
+    ``test_glue_tabs.py`` で別に検証する。
+    """
     if isinstance(obj, dict):
-        return {k: normalise(obj[k]) for k in sorted(obj)}
+        return {
+            k: normalise(obj[k]) for k in sorted(obj) if k != "glue_tabs"
+        }
     if isinstance(obj, list):
         return [normalise(v) for v in obj]
     if isinstance(obj, (int, float)):

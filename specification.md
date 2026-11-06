@@ -126,7 +126,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["net_id", "metrics", "faces"],
+        "required": ["net_id", "metrics", "faces", "glue_tabs"],
         "properties": {
           "net_id": { "type": "integer", "minimum": 1 },
           "metrics": {
@@ -214,6 +214,62 @@
                 }
               }
             }
+          },
+          "glue_tabs": {
+            "type": "array",
+            "description": "のりしろ。展開図で切れている共有辺ごとに、両面のうちちょうど片側へ 1 枚だけ付く",
+            "items": {
+              "type": "object",
+              "required": ["face_id", "neighbor_face_id", "edge_3d", "edge_2d", "vertices_2d"],
+              "properties": {
+                "face_id": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "のりしろを付ける面。この面の外周に貼り付く"
+                },
+                "neighbor_face_id": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "立体にしたときにこののりしろが接着する相手の面"
+                },
+                "edge_3d": {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "items": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 3,
+                    "items": { "type": "number" }
+                  },
+                  "description": "立体上での共有辺（edge_2d と同じ順）"
+                },
+                "edge_2d": {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": { "type": "number" }
+                  },
+                  "description": "展開図上での貼り付け辺。vertices_2d の最初の 2 点"
+                },
+                "vertices_2d": {
+                  "type": "array",
+                  "minItems": 4,
+                  "maxItems": 4,
+                  "items": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": { "type": "number" }
+                  },
+                  "description": "のりしろの台形（貼り付け辺の始点・終点・外側の終点・外側の始点）"
+                }
+              }
+            }
           }
         }
       }
@@ -248,6 +304,18 @@
 *   **同じ直線上でも山折りと谷折りが混在する場合や、折り角の大きさが違う場合は別の折り操作として数える。** 1 回の直線折りでは、その直線上の紙を同じ向き・同じ角度にしか折れないため。
 *   展開図の大きさで直線を正規化してから比較するため、立体の拡大・縮小で値は変わらない。
 *   指標の計算は `fifth.net_metrics` が唯一の定義。API と CLI はどちらもこれを呼ぶ。
+
+### 3.6 のりしろ（glue tab）の求め方
+
+展開図では、面グラフの隣接辺のうち**全域木に含まれない辺**が切れている。この辺は立体にすると 2 面が接するので、組み立て時に貼り合わせるためののりしろが要る。
+
+1.  切れている共有辺ごとに、両端の面それぞれへ付けた場合の台形を作る。台形は貼り付け辺の長さ `L` に対して奥行き `0.25L`、上辺を左右に `0.25L` ずつ逃がした形（側面 45 度）とする。
+2.  両方の候補のうち、面や他ののりしろとの重なり面積が小さくなる側を **1 枚だけ**選ぶ。
+3.  したがって、1 本の切れている辺について「両方に付く」「どちらにも付かない」は起こらない。**必ず片側にだけ付く。**
+
+*   のりしろは面のポリゴンには含めない。`bounding_box` / `perimeter` / `fold_count` はのりしろを付ける前と同じ値になる（折る回数からは無視する）。
+*   外周が入り組んだ展開図では、どちら側にも面積のあるのりしろを置けないことがある（面が角で接している場合）。その場合も「片側に 1 枚」という規則は崩さず、重なりが小さい側を選ぶ。
+*   実装は `fifth.glue_tabs`。API の `glue_tabs` と CLI の画像が同じ関数を使う。
 
 ---
 

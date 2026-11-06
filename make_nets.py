@@ -187,12 +187,25 @@ SOLIDS = {
 }
 
 
-def plot_net(polygons: list[Polygon], title: str, filename: str) -> None:
-    """展開図のポリゴンリストを 2D プロットして保存する。"""
+def plot_net(
+    polygons: list[Polygon],
+    glue_tabs: list[fifth.GlueTab],
+    title: str,
+    filename: str,
+) -> None:
+    """展開図のポリゴンとのりしろを 2D プロットして保存する。"""
     _fig, ax = plt.subplots(figsize=(6, 6))
 
     all_x: list[float] = []
     all_y: list[float] = []
+
+    for tab in glue_tabs:
+        tx = [p[0] for p in tab.vertices_2d] + [tab.vertices_2d[0][0]]
+        ty = [p[1] for p in tab.vertices_2d] + [tab.vertices_2d[0][1]]
+        all_x.extend(tx)
+        all_y.extend(ty)
+        ax.fill(tx, ty, alpha=0.25, fc="orange", ec="darkorange", lw=1)
+
     for idx, poly in enumerate(polygons):
         x, y = poly.exterior.xy
         all_x.extend(x)
@@ -258,9 +271,10 @@ def main() -> None:
 
     metrics = []
     shared_of = fifth.build_shared_of(faces)
+    pair_to_edge = fifth._pair_to_edge(faces)
     for tree, polys in nets:
         m = fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of)
-        metrics.append((m, polys))
+        metrics.append((m, tree, polys))
     metrics.sort(key=lambda s: fifth.metric_sort_key(s[0], args.sort_by))
 
     if args.top_n > 0:
@@ -270,9 +284,15 @@ def main() -> None:
     print(f"一意な展開図: {len(metrics)} 個{suffix}")
     os.makedirs(args.outdir, exist_ok=True)
 
-    for idx, (m, polys) in enumerate(metrics, start=1):
+    for idx, (m, tree, polys) in enumerate(metrics, start=1):
         filename = os.path.join(args.outdir, f"{args.solid}_net_{idx}.png")
-        plot_net(polys, f"{args.solid} net {idx}  area={m.bounding_box_area:g}", filename)
+        tabs = fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
+        plot_net(
+            polys,
+            tabs,
+            f"{args.solid} net {idx}  area={m.bounding_box_area:g}",
+            filename,
+        )
         print(
             f"Saved: {filename}  "
             f"(外接矩形面積 {m.bounding_box_area:g}, "

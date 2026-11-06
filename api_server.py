@@ -175,6 +175,20 @@ def _face_geometry(
     ]
 
 
+def _glue_tabs_json(tabs: list[fifth.GlueTab]) -> list[dict[str, object]]:
+    """のりしろを JSON の形にする（幾何の計算は fifth.glue_tabs）。"""
+    return [
+        {
+            "face_id": t.face_id,
+            "neighbor_face_id": t.neighbor_face_id,
+            "edge_3d": t.edge_3d,
+            "edge_2d": t.edge_2d,
+            "vertices_2d": t.vertices_2d,
+        }
+        for t in tabs
+    ]
+
+
 def _error(
     type_: str,
     msg: str,
@@ -288,6 +302,9 @@ def calculate_nets(req: SolidRequest) -> dict[str, object]:
                 "metrics": metrics_json(metrics),
                 "faces": _face_geometry(
                     vertices, faces, normals, tree, polys, pair_to_edge
+                ),
+                "glue_tabs": _glue_tabs_json(
+                    fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
                 ),
             }
         )
