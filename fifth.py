@@ -1605,10 +1605,23 @@ def _dihedral_deg(
 
 
 def _pair_to_edge(faces: list[list[int]]) -> dict[frozenset[int], tuple[int, int]]:
-    """{(面u, 面v): 共有辺} のマップを作る。"""
-    return {
-        frozenset((u, v)): edge for u, v, edge in build_adjacency_with_edges(faces)
-    }
+    """{(面u, 面v): 共有辺} のマップを作る。
+
+    同じ2面が2本以上の辺を共有する入力は受け付けない。辞書の内包表記で
+    黙って上書きすると、切れている辺の片方がのりしろ無しになるため。
+    """
+    pair_to_edge: dict[frozenset[int], tuple[int, int]] = {}
+    for u, v, edge in build_adjacency_with_edges(faces):
+        pair = frozenset((u, v))
+        if pair in pair_to_edge:
+            a, b = sorted(pair)
+            raise SolidError(
+                "multiple_shared_edges",
+                f"面{a} と面{b} が2本以上の辺を共有しています。"
+                "1組の面が共有できる辺は1本までです。",
+            )
+        pair_to_edge[pair] = edge
+    return pair_to_edge
 
 
 def _fold_axis_2d(
@@ -1805,6 +1818,26 @@ def _candidate_overlap(a: _TabCandidate, b: _TabCandidate) -> float:
     )
 
 
+def _cost_less(a: float, b: float) -> bool:
+    """``a`` が ``b`` より「意味のある差」で小さいか。
+
+    展開図を拡大・縮小すると重なり面積はスケール^2 で変わる。厳密な
+    ``<`` で比べると、数学的には同値な候補の差が浮動小数ノイズで
+    逆転し、選ぶ側がスケールで変わってしまう（実測: L 字柱 1e-6 倍で
+    1516 枚中 280 枚）。相対トレランス内の差は同値とみなす。
+    """
+    return a < b and not math.isclose(a, b, rel_tol=1e-12, abs_tol=0.0)
+
+
+def _pick_side(costs: list[float]) -> int:
+    """コストが最小の候補を選ぶ。同値なら先頭（面番号の小さい側）。"""
+    best = 0
+    for k in range(1, len(costs)):
+        if _cost_less(costs[k], costs[best]):
+            best = k
+    return best
+
+
 def _choose_tab_sides(
     candidates: list[list[_TabCandidate]],
     polys: list[Polygon],
@@ -1841,7 +1874,7 @@ def _choose_tab_sides(
             for k in range(len(pair))
         ]
         # 同コストなら先頭（面番号の小さい側）を選ぶ。出力を決定的にするため。
-        k = min(range(len(pair)), key=lambda k_: (costs[k_], k_))
+        k = _pick_side(costs)
         chosen.append(pair[k])
         chosen_idx.append(k)
 
@@ -1861,10 +1894,14 @@ def _choose_tab_sides(
                 for k in range(len(pair))
             ]
             costs = [unary[i][k] + other_unary[k] for k in range(len(pair))]
-            k = min(range(len(pair)), key=lambda k_: (costs[k_], k_))
-            if costs[k] < costs[chosen_idx[i]]:
-                chosen[i] = pair[k]
-                chosen_idx[i] = k
+            best = _pick_side(costs)
+            cur = chosen_idx[i]
+            # 意味のある改善があるとき、または同値で先頭側に寄せられるときに
+            # 切り替える。同値判定に相対トレランスを使うので、拡大・縮小しても
+            # 選ぶ側が変わらない。
+            if best != cur and not _cost_less(costs[cur], costs[best]):
+                chosen[i] = pair[best]
+                chosen_idx[i] = best
                 improved = True
         if not improved:
             break

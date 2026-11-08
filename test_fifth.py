@@ -222,6 +222,19 @@ def test_two_faces_sharing_two_edges_are_rejected():
     assert ei.value.code == "multiple_shared_edges"
 
 
+def test_pair_to_edge_rejects_two_edges_between_the_same_faces():
+    """validate_solid を飛ばしても、面対→共有辺の対応が黙って上書きしない。
+
+    同じ2面が2本の辺を共有する入力では ``_pair_to_edge`` の辞書が片方を
+    失い、切れている辺の片方にのりしろが付かなくなる。直接呼ぶ利用者にも
+    同じエラーを見せる。
+    """
+    faces = [[0, 1, 2, 3], [0, 1, 3, 2]]  # 辺 (0,1) と (2,3) を共有
+    with pytest.raises(fifth.SolidError) as ei:
+        fifth._pair_to_edge(faces)
+    assert ei.value.code == "multiple_shared_edges"
+
+
 def test_orient_faces_outward_is_winding_independent():
     """呼び出し側は巻き順を意識しなくてよい。"""
     v, f = cube()
@@ -348,7 +361,7 @@ def test_orient_faces_outward_rejects_boundary_input_loudly():
     """前条件を破った入力は黙って無視せず ValueError になる。
 
     ``orient_faces_outward`` から削除した ``if len(holders) != 2: continue``
-    は、``validate_solid`` を先に通，才有この関数の到達不能な守護が存在する前提の守護だった。
+    は、``validate_solid`` を先に通す前提では到達不能な守護だった。
     守護を外したので、破ったときはタプル展開が ValueError として現れる。
     このテストはその契約が文書どおりであることを固定する。
     """

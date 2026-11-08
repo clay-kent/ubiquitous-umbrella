@@ -171,7 +171,7 @@ uvicorn api_server:app --reload
       "glue_tabs": [
         {
           "face_id": 0,
-          "neighbor_face_id": 1,
+          "neighbor_face_id": 3,
           "edge_3d": [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
           "edge_2d": [[1.0, 0.0], [1.0, 1.0]],
           "vertices_2d": [[1.0, 0.0], [1.0, 1.0], [1.25, 0.75], [1.25, 0.25]]

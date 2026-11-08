@@ -218,10 +218,11 @@ def test_glue_tabs_does_not_mutate_faces():
 def test_api_returns_glue_tabs():
     """API の応答にのりしろが入り、辺の対応が展開図と一致すること。"""
     vertices, faces = make_nets.box(1, 1, 1)
+    top_n = 3
     body = {
         "vertices": [[float(c) for c in p] for p in vertices.tolist()],
         "faces": faces,
-        "top_n": 3,
+        "top_n": top_n,
         "sort_by": "area",
     }
     response = client.post(URL, json=body)
@@ -244,3 +245,28 @@ def test_api_returns_glue_tabs():
         keys = [frozenset((t["face_id"], t["neighbor_face_id"])) for t in tabs]
         assert len(keys) == len(set(keys))
         assert set(keys) == cut
+
+    # JSON のキー名と値が、同じ展開図に対する fifth.glue_tabs の結果と
+    # 完全に一致すること。golden は glue_tabs を除外しているので、
+    # ここで直列化の対応を固定する。
+    oriented = fifth.orient_faces_outward(vertices, faces)
+    normals = fifth.compute_normals(vertices, oriented)
+    shared_of = fifth.build_shared_of(oriented)
+    pair_to_edge = fifth._pair_to_edge(oriented)
+    scored = [
+        (
+            fifth.net_metrics(polys, tree, vertices, oriented, normals, shared_of),
+            tree,
+            polys,
+        )
+        for tree, polys in net_test_cache.unique_nets(vertices, oriented)
+    ]
+    scored.sort(key=lambda s: fifth.metric_sort_key(s[0], "area"))
+
+    expected = [
+        api_server._glue_tabs_json(
+            fifth.glue_tabs(polys, oriented, tree, pair_to_edge, vertices)
+        )
+        for _metrics, tree, polys in scored[:top_n]
+    ]
+    assert [net["glue_tabs"] for net in payload["nets"]] == expected

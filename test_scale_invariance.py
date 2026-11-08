@@ -178,3 +178,38 @@ def test_fold_axis_is_scale_invariant(builder, scale):
     baseline = _fold_axes(builder, 1.0)
     assert baseline  # 空だと空振りになるので、何か出ていることを明示する
     assert _fold_axes(builder, scale) == baseline
+
+
+# --------------------------------------------------------------------------
+# のりしろの側選択（一意数・折り曲げ軸とは別）
+# --------------------------------------------------------------------------
+
+
+def _tab_sides(builder, scale):
+    """各展開図で、切れている辺をどちらの面に貼ったかを集める。"""
+    v, f = builder()
+    v = v.astype(float) * scale
+    faces = fifth.orient_faces_outward(v, f)
+    pair_to_edge = fifth._pair_to_edge(faces)
+    return [
+        {
+            tuple(sorted((t.face_id, t.neighbor_face_id))): (
+                t.face_id,
+                t.neighbor_face_id,
+            )
+            for t in fifth.glue_tabs(polys, faces, tree, pair_to_edge, v)
+        }
+        for tree, polys in net_test_cache.unique_nets(v, faces)
+    ]
+
+
+@pytest.mark.slow
+def test_glue_tab_sides_are_scale_invariant():
+    """重なりコストが同値のとき、縮尺で貼る側が変わらないこと。
+
+    のりしろの重なり面積はスケール^2 で変わる。厳密な ``<`` で比べると
+    同値候補の差が浮動小数ノイズで逆転し、L 字柱 1e-6 倍では 1516 枚中
+    280 枚で同じ辺の貼り付け面が反転していた。相対トレランスの同値判定と
+    「同値なら面番号の小さい側」の規則を固定する。
+    """
+    assert _tab_sides(make_nets.l_shape, 1.0) == _tab_sides(make_nets.l_shape, 1e-6)
