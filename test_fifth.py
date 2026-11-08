@@ -193,6 +193,35 @@ def test_open_surface_is_rejected():
         fifth.validate_solid(v, f[:4])
 
 
+def test_two_faces_sharing_two_edges_are_rejected():
+    """1組の面が2本の辺を共有する入力を弾く。
+
+    展開図の親子・共有辺の対応（shared_of / _pair_to_edge）は
+    「隣接する2面の共有辺はちょうど1本」を前提にしている。
+    立方体の底面を小さい四角と L 字に分割すると、その2面は2本の辺を共有する。
+    """
+    v = np.array(
+        [
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+            [0.5, 0, 0], [0, 0.5, 0], [0.5, 0.5, 0],
+        ],
+        dtype=float,
+    )
+    f = [
+        [0, 8, 10, 9],        # 底面の小さい四角
+        [8, 1, 2, 3, 9, 10],  # 底面の残り（L 字）
+        [4, 5, 6, 7],
+        [0, 8, 1, 5, 4],
+        [1, 2, 6, 5],
+        [2, 3, 7, 6],
+        [3, 9, 0, 4, 7],
+    ]
+    with pytest.raises(fifth.SolidError) as ei:
+        fifth.validate_solid(v, f)
+    assert ei.value.code == "multiple_shared_edges"
+
+
 def test_orient_faces_outward_is_winding_independent():
     """呼び出し側は巻き順を意識しなくてよい。"""
     v, f = cube()

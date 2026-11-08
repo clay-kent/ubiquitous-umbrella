@@ -137,6 +137,10 @@ def validate_solid(
             raise SolidError("non_planar_face", f"面{f_idx} は平面ではありません。")
 
     # 閉じた2多様体であること（各辺がちょうど2面に共有される）
+    # あわせて、同じ2面が2本以上の辺を共有していないことを確認する。
+    # 展開図の親子・共有辺の対応（shared_of / _pair_to_edge）は
+    # 「隣接する2面の共有辺はちょうど1本」を前提にしているため。
+    shared_pairs: set[frozenset[int]] = set()
     for edge, holders in build_edge_map(faces).items():
         if len(holders) != 2:
             raise SolidError(
@@ -144,6 +148,15 @@ def validate_solid(
                 f"辺{edge} が{len(holders)}個の面に共有されています。"
                 "閉じていないか非多様体です。",
             )
+        pair = frozenset((holders[0][0], holders[1][0]))
+        if pair in shared_pairs:
+            u, v = sorted(pair)
+            raise SolidError(
+                "multiple_shared_edges",
+                f"面{u} と面{v} が2本以上の辺を共有しています。"
+                "1組の面が共有できる辺は1本までです。",
+            )
+        shared_pairs.add(pair)
 
     # 各頂点まわりの面が1つのサイクルをなすこと（面の飛び）を検出
     for v_idx in range(n_v):
@@ -1658,6 +1671,9 @@ class _TabCandidate(NamedTuple):
     edge_2d: list[list[float]]
     vertices_2d: list[list[float]]
     polygon: Polygon
+    # 重なり判定で何度も呼ぶので、外接矩形と面積を先に持っておく。
+    bounds: tuple[float, float, float, float]
+    area: float
 
 
 def _tab_loop_coords(poly: Polygon) -> list[tuple[float, float]]:
@@ -1735,6 +1751,7 @@ def _make_tab_candidate(
         [q0x, q0y],
     ]
     ea, eb = face[idx], face[(idx + 1) % n]
+    polygon = Polygon(verts)
     return _TabCandidate(
         face_id=face_id,
         neighbor_face_id=neighbor_face_id,
@@ -1744,15 +1761,48 @@ def _make_tab_candidate(
         ],
         edge_2d=[[p0x, p0y], [p1x, p1y]],
         vertices_2d=verts,
-        polygon=Polygon(verts),
+        polygon=polygon,
+        bounds=polygon.bounds,
+        area=polygon.area,
     )
 
 
-def _tab_overlap_area(a: Polygon, b: Polygon, scale: float) -> float:
-    """2 つのポリゴンの交差面積。浮動ノイズは 0 とみなす。"""
+def _intersection_area(
+    a: Polygon,
+    b: Polygon,
+    a_bounds: tuple[float, float, float, float],
+    b_bounds: tuple[float, float, float, float],
+    a_area: float,
+    b_area: float,
+) -> float:
+    """外接矩形で棄却してから交差面積を求める（閾値は局所面積）。"""
+    if (
+        a_bounds[2] < b_bounds[0]
+        or b_bounds[2] < a_bounds[0]
+        or a_bounds[3] < b_bounds[1]
+        or b_bounds[3] < a_bounds[1]
+    ):
+        return 0.0
     area = a.intersection(b).area
-    threshold = OVERLAP_AREA_REL_TOL * scale * scale
+    threshold = OVERLAP_AREA_REL_TOL * min(a_area, b_area)
     return float(area) if area > threshold else 0.0
+
+
+def _tab_overlap_area(a: Polygon, b: Polygon) -> float:
+    """2 つのポリゴンの交差面積。浮動ノイズは 0 とみなす。
+
+    閾値は**小さいほうのポリゴンの面積**に対する比にする。展開図全体の
+    大きさを基準にすると、長い辺と短い辺が混在する展開図で、短い辺の
+    のりしろが丸ごと面に乗っていても「重なり 0」と誤判定してしまう。
+    """
+    return _intersection_area(a, b, a.bounds, b.bounds, a.area, b.area)
+
+
+def _candidate_overlap(a: _TabCandidate, b: _TabCandidate) -> float:
+    """のりしろ候補同士の交差面積（外接矩形と面積は候補が持つ）。"""
+    return _intersection_area(
+        a.polygon, b.polygon, a.bounds, b.bounds, a.area, b.area
+    )
 
 
 def _choose_tab_sides(
@@ -1768,27 +1818,26 @@ def _choose_tab_sides(
     if not candidates:
         return []
 
-    extent = max(
-        max(p.bounds[2] - p.bounds[0], p.bounds[3] - p.bounds[1]) for p in polys
-    )
-    scale = extent or 1.0
-    unary = [
-        [
-            sum(_tab_overlap_area(c.polygon, poly, scale) for poly in polys)
-            for c in pair
-        ]
-        for pair in candidates
-    ]
+    # 面の外接矩形と面積は何度も引くので先に取る（GEOS 呼び出しを減らす）。
+    face_bounds = [poly.bounds for poly in polys]
+    face_areas = [poly.area for poly in polys]
+
+    def unary_of(c: _TabCandidate) -> float:
+        return sum(
+            _intersection_area(
+                c.polygon, poly, c.bounds, fb, c.area, fa
+            )
+            for poly, fb, fa in zip(polys, face_bounds, face_areas)
+        )
+
+    unary = [[unary_of(c) for c in pair] for pair in candidates]
 
     chosen: list[_TabCandidate] = []
     chosen_idx: list[int] = []
     for i, pair in enumerate(candidates):
         costs = [
             unary[i][k]
-            + sum(
-                _tab_overlap_area(pair[k].polygon, chosen[j].polygon, scale)
-                for j in range(len(chosen))
-            )
+            + sum(_candidate_overlap(pair[k], chosen[j]) for j in range(len(chosen)))
             for k in range(len(pair))
         ]
         # 同コストなら先頭（面番号の小さい側）を選ぶ。出力を決定的にするため。
@@ -1805,7 +1854,7 @@ def _choose_tab_sides(
                 continue
             other_unary = [
                 sum(
-                    _tab_overlap_area(pair[k].polygon, chosen[j].polygon, scale)
+                    _candidate_overlap(pair[k], chosen[j])
                     for j in range(len(chosen))
                     if j != i
                 )

@@ -138,10 +138,6 @@ def test_tab_shape_is_positive_and_outside_faces(builder):
 
     for tree, polys in nets:
         tabs = fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
-        extent = max(
-            max(p.bounds[2] - p.bounds[0], p.bounds[3] - p.bounds[1]) for p in polys
-        )
-        scale = extent or 1.0
 
         for tab in tabs:
             tab_poly = Polygon(tab.vertices_2d)
@@ -150,30 +146,73 @@ def test_tab_shape_is_positive_and_outside_faces(builder):
             assert tab_poly.area > 0.0
             # 面の内部と重ならない（境界で接するだけ）。
             for poly in polys:
-                assert fifth._tab_overlap_area(tab_poly, poly, scale) == 0.0
+                assert fifth._tab_overlap_area(tab_poly, poly) == 0.0
 
         # のりしろ同士も重ならない。
         tab_polys = [Polygon(t.vertices_2d) for t in tabs]
         for i in range(len(tab_polys)):
             for j in range(i + 1, len(tab_polys)):
-                assert (
-                    fifth._tab_overlap_area(tab_polys[i], tab_polys[j], scale) == 0.0
-                )
+                assert fifth._tab_overlap_area(tab_polys[i], tab_polys[j]) == 0.0
 
 
-def test_metrics_do_not_include_glue_tabs():
-    """のりしろは面のポリゴンに含めないので、指標は変わらない。"""
-    vertices, faces, normals, nets = _nets(lambda: make_nets.box(1, 1, 1))
-    shared_of = fifth.build_shared_of(faces)
+@pytest.mark.slow
+def test_lshape_tab_geometry_is_valid():
+    """凹角のある立体でも、のりしろ自体は健全で、同士で重ならないこと。
+
+    L 字柱の一部の展開図は面が角で接しており、どちら側にも面積のある
+    のりしろを置けない（別の面と重なる）。それは配置の制約であって
+    台形の破損ではないので、ここでは「自分の面」「他ののりしろ」との
+    重なりだけを確認する。
+    """
+    vertices, faces, _normals, nets = _nets(make_nets.l_shape)
+    pair_to_edge = fifth._pair_to_edge(faces)
 
     for tree, polys in nets:
+        tabs = fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
+
+        tab_polys = []
+        for tab in tabs:
+            points = {_point_key(p) for p in tab.vertices_2d}
+            assert len(points) == 4
+            tab_poly = Polygon(tab.vertices_2d)
+            assert tab_poly.is_valid
+            assert tab_poly.area > 0.0
+            # 自分の面の内部へははみ出さない（外周で接するだけ）。
+            assert fifth._tab_overlap_area(tab_poly, polys[tab.face_id]) == 0.0
+            tab_polys.append(tab_poly)
+
+        for i in range(len(tab_polys)):
+            for j in range(i + 1, len(tab_polys)):
+                assert fifth._tab_overlap_area(tab_polys[i], tab_polys[j]) == 0.0
+
+
+def test_tab_overlap_threshold_uses_local_area():
+    """短い辺ののりしろでも、実重なりを 0 と誤判定しないこと。
+
+    展開図全体の面積を基準にすると、長い辺と短い辺が混在するときに
+    短い辺の重なりが閾値の下へ隠れる（レビュー指摘）。局所面積を
+    基準にしたことを直接固定する。
+    """
+    big = Polygon([(0, 0), (1000, 0), (1000, 1000), (0, 1000)])
+    small = Polygon([(0, 0), (0.1, 0), (0.1, 0.1), (0, 0.1)])
+    # 交差面積 0.01。旧実装の閾値 1e-7 * 1000^2 = 0.1 なら 0 になっていた。
+    assert fifth._tab_overlap_area(big, small) == pytest.approx(0.01)
+
+
+def test_glue_tabs_does_not_mutate_faces():
+    """のりしろを計算しても、面のポリゴンと指標は変わらないこと。"""
+    vertices, faces, normals, nets = _nets(lambda: make_nets.box(1, 1, 1))
+    shared_of = fifth.build_shared_of(faces)
+    pair_to_edge = fifth._pair_to_edge(faces)
+
+    for tree, polys in nets:
+        before_wkb = [poly.wkb for poly in polys]
         before = fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of)
-        tabs = fifth.glue_tabs(
-            polys, faces, tree, fifth._pair_to_edge(faces), vertices
-        )
+        tabs = fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
         after = fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of)
         assert tabs
         assert before == after
+        assert [poly.wkb for poly in polys] == before_wkb
 
 
 def test_api_returns_glue_tabs():
