@@ -42,15 +42,24 @@ CASES = [
 CASES_WITHOUT_TAB_OVERLAP = CASES[:6]
 
 
-def _thin_l_shape():
-    """凹角のある細い L 字柱。のりしろ同士が重なる展開図を含む。"""
-    pts = [(0, 0), (3, 0), (3, 0.5), (1, 0.5), (1, 1), (0, 1)]
+def _l_prism(pts):
+    """L 字断面を押し出した角柱。"""
     vertices = np.array(
         [[x, y, 0.0] for x, y in pts] + [[x, y, 1.0] for x, y in pts]
     )
     faces = [list(range(5, -1, -1)), list(range(6, 12))]
     faces += [[i, (i + 1) % 6, 6 + (i + 1) % 6, 6 + i] for i in range(6)]
     return vertices, faces
+
+
+def _thin_l_shape():
+    """凹角のある細い L 字柱。のりしろ同士が重なる展開図を含む。"""
+    return _l_prism([(0, 0), (3, 0), (3, 0.5), (1, 0.5), (1, 1), (0, 1)])
+
+
+def _g_l_shape():
+    """下辺が太い L 字柱。奥行きを下限まで縮めないと消えない重なりを含む。"""
+    return _l_prism([(0, 0), (3, 0), (3, 0.8), (1, 0.8), (1, 1), (0, 1)])
 
 
 def _point_key(point):
@@ -199,15 +208,20 @@ def test_lshape_tab_geometry_is_valid():
 
 
 @pytest.mark.slow
-def test_thin_lshape_shrinks_tabs_to_avoid_tab_tab_overlap():
+@pytest.mark.parametrize(
+    "builder",
+    [_thin_l_shape, _g_l_shape],
+    ids=["thin-L", "G-L"],
+)
+def test_lshape_shrinks_tabs_to_avoid_tab_tab_overlap(builder):
     """のりしろ同士が重なる展開図で、奥行きを縮めて重なりを消すこと。
 
-    細い L 字柱（断面 3 x 1 から 2 x 0.5 を欠いた形）は、既定の奥行き
-    0.25L だと 56 枚の展開図でのりしろ同士が重なる。側の選び方だけでは
-    消せないので、奥行きを縮める。面が角で接する展開図では面との重なりは
-    残るが、のりしろ同士は重ならない。
+    細い L 字柱と、下辺が太い L 字柱は、既定の奥行き 0.25L だと
+    のりしろ同士が重なる展開図を含む。側の選び方だけでは消せないので、
+    奥行きを縮める。面が角で接する展開図では面との重なりは残るが、
+    のりしろ同士は重ならない（下限まで縮めても消えない場合は下限で残す）。
     """
-    vertices, faces = _thin_l_shape()
+    vertices, faces = builder()
     fifth.validate_solid(vertices, faces)
     pair_to_edge = fifth._pair_to_edge(faces)
     nets = net_test_cache.unique_nets(vertices, faces)
@@ -216,7 +230,14 @@ def test_thin_lshape_shrinks_tabs_to_avoid_tab_tab_overlap():
     for tree, polys in nets:
         tabs = fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
 
+        tab_polys = []
         for tab in tabs:
+            # 貼り付け辺は面の外周と共有したまま（縮めても外れない）。
+            assert tab.vertices_2d[:2] == tab.edge_2d
+            tab_poly = Polygon(tab.vertices_2d)
+            assert tab_poly.area > 0.0
+            tab_polys.append(tab_poly)
+
             length = math.dist(tab.edge_2d[0], tab.edge_2d[1])
             p0, p1, q1, q0 = tab.vertices_2d
             depth = math.dist(
@@ -226,7 +247,6 @@ def test_thin_lshape_shrinks_tabs_to_avoid_tab_tab_overlap():
             if depth < 0.99 * fifth.TAB_DEPTH_RATIO * length:
                 shrunk += 1
 
-        tab_polys = [Polygon(t.vertices_2d) for t in tabs]
         for i in range(len(tab_polys)):
             for j in range(i + 1, len(tab_polys)):
                 assert fifth._tab_overlap_area(tab_polys[i], tab_polys[j]) == 0.0
