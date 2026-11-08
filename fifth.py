@@ -33,8 +33,7 @@ TAB_MAX_END_INSET_RATIO = 0.45
 
 # のりしろ同士が重なるときに奥行きを縮める下限（元の奥行きに対する比）。
 # 0 にすると面積 0 の「のりしろ」になるので、貼り合わせに使える大きさを残す。
-# 下限まで縮めても重なりが消えない場合は、縮めず元の大きさのまま返す
-# （面が角で接している展開図では、そもそもどちら側にも置けない）。
+# 下限まで縮めても重なりが消えない場合は、その下限の大きさで返す。
 TAB_MIN_SHRINK_RATIO = 0.1
 TAB_SHRINK_ITERS = 12
 
@@ -1854,7 +1853,7 @@ def _tab_clear(
     c: _TabCandidate,
     obstacles: list[tuple[Polygon, tuple[float, float, float, float], float]],
 ) -> bool:
-    """のりしろが障害物（面・他ののりしろ）と重ならないか。"""
+    """のりしろが他ののりしろと重ならないか。"""
     for poly, bounds, area in obstacles:
         if _intersection_area(c.polygon, poly, c.bounds, bounds, c.area, area) > 0.0:
             return False
@@ -2025,8 +2024,8 @@ def glue_tabs(
     （仕様では折る回数からのりしろを無視する）。
 
     のりしろ同士が重なる場合は、重なりが消えるまで奥行きを縮める
-    （:func:`_refine_tab_depths`）。面が角で接していて、どちら側にも
-    置き場所がない展開図では、重なりを完全には消せない。
+    （:func:`_refine_tab_depths`、下限は元の 0.1 倍）。面が角で接して
+    どちら側にも置き場所がない展開図では、面との重なりは残る。
     """
     n_faces = len(faces)
     tree_pairs = {frozenset(edge) for edge in tree_edges}

@@ -255,6 +255,35 @@ def test_lshape_shrinks_tabs_to_avoid_tab_tab_overlap(builder):
     assert shrunk > 0
 
 
+@pytest.mark.slow
+def test_face_overlap_alone_does_not_shrink_tabs():
+    """面との重なりだけでは奥行きを縮めないこと。
+
+    G-L の 6 番目の展開図では、面1→面4 ののりしろが面4と 0.39 重なるが、
+    他ののりしろとは重ならない。面を障害物に含めると、こののりしろが
+    奥行き 0.4 倍まで縮んでしまう（レビュー指摘）。縮めないことを固定する。
+    """
+    vertices, faces = _g_l_shape()
+    pair_to_edge = fifth._pair_to_edge(faces)
+    nets = net_test_cache.unique_nets(vertices, faces)
+    tree, polys = nets[6]
+    tabs = fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
+
+    tab = next(
+        t for t in tabs if t.face_id == 1 and t.neighbor_face_id == 4
+    )
+    # 前提: 面4とは重なっている（面が角で接する展開図）。
+    assert fifth._tab_overlap_area(Polygon(tab.vertices_2d), polys[4]) > 0.0
+
+    length = math.dist(tab.edge_2d[0], tab.edge_2d[1])
+    p0, p1, q1, q0 = tab.vertices_2d
+    depth = math.dist(
+        ((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2),
+        ((q0[0] + q1[0]) / 2, (q0[1] + q1[1]) / 2),
+    )
+    assert depth == pytest.approx(fifth.TAB_DEPTH_RATIO * length)
+
+
 def test_tab_overlap_threshold_uses_local_area():
     """短い辺ののりしろでも、実重なりを 0 と誤判定しないこと。
 
