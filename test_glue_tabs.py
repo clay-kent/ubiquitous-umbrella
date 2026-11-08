@@ -11,6 +11,7 @@
 
 import math
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from shapely.geometry import Polygon
@@ -39,6 +40,17 @@ CASES = [
 # 単純（凹角の奥に別の面が潜り込んでいない）な立体だけ。L 字柱の一部の
 # 展開図は面が角で接しており、どちら側にも面積のあるのりしろを置けない。
 CASES_WITHOUT_TAB_OVERLAP = CASES[:6]
+
+
+def _thin_l_shape():
+    """凹角のある細い L 字柱。のりしろ同士が重なる展開図を含む。"""
+    pts = [(0, 0), (3, 0), (3, 0.5), (1, 0.5), (1, 1), (0, 1)]
+    vertices = np.array(
+        [[x, y, 0.0] for x, y in pts] + [[x, y, 1.0] for x, y in pts]
+    )
+    faces = [list(range(5, -1, -1)), list(range(6, 12))]
+    faces += [[i, (i + 1) % 6, 6 + (i + 1) % 6, 6 + i] for i in range(6)]
+    return vertices, faces
 
 
 def _point_key(point):
@@ -184,6 +196,43 @@ def test_lshape_tab_geometry_is_valid():
         for i in range(len(tab_polys)):
             for j in range(i + 1, len(tab_polys)):
                 assert fifth._tab_overlap_area(tab_polys[i], tab_polys[j]) == 0.0
+
+
+@pytest.mark.slow
+def test_thin_lshape_shrinks_tabs_to_avoid_tab_tab_overlap():
+    """のりしろ同士が重なる展開図で、奥行きを縮めて重なりを消すこと。
+
+    細い L 字柱（断面 3 x 1 から 2 x 0.5 を欠いた形）は、既定の奥行き
+    0.25L だと 56 枚の展開図でのりしろ同士が重なる。側の選び方だけでは
+    消せないので、奥行きを縮める。面が角で接する展開図では面との重なりは
+    残るが、のりしろ同士は重ならない。
+    """
+    vertices, faces = _thin_l_shape()
+    fifth.validate_solid(vertices, faces)
+    pair_to_edge = fifth._pair_to_edge(faces)
+    nets = net_test_cache.unique_nets(vertices, faces)
+    shrunk = 0
+
+    for tree, polys in nets:
+        tabs = fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
+
+        for tab in tabs:
+            length = math.dist(tab.edge_2d[0], tab.edge_2d[1])
+            p0, p1, q1, q0 = tab.vertices_2d
+            depth = math.dist(
+                ((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2),
+                ((q0[0] + q1[0]) / 2, (q0[1] + q1[1]) / 2),
+            )
+            if depth < 0.99 * fifth.TAB_DEPTH_RATIO * length:
+                shrunk += 1
+
+        tab_polys = [Polygon(t.vertices_2d) for t in tabs]
+        for i in range(len(tab_polys)):
+            for j in range(i + 1, len(tab_polys)):
+                assert fifth._tab_overlap_area(tab_polys[i], tab_polys[j]) == 0.0
+
+    # 実際に縮めたのりしろが存在すること（空振り防止）。
+    assert shrunk > 0
 
 
 def test_tab_overlap_threshold_uses_local_area():

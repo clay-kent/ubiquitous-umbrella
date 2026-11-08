@@ -31,6 +31,13 @@ TAB_DEPTH_RATIO = 0.25
 TAB_SIDE_SLANT = 1.0
 TAB_MAX_END_INSET_RATIO = 0.45
 
+# のりしろ同士が重なるときに奥行きを縮める下限（元の奥行きに対する比）。
+# 0 にすると面積 0 の「のりしろ」になるので、貼り合わせに使える大きさを残す。
+# 下限まで縮めても重なりが消えない場合は、縮めず元の大きさのまま返す
+# （面が角で接している展開図では、そもそもどちら側にも置けない）。
+TAB_MIN_SHRINK_RATIO = 0.1
+TAB_SHRINK_ITERS = 12
+
 # 個別化-細分の仕事量上限。これを超えると 422 で失敗させる。
 # 根拠（実測）: どのプリセットでも最大でも 126 程度（prism5）。最も重い
 # lshape でも数千程度なので 1500 倍以上の余裕があり、実入力では到達しない。
@@ -1818,6 +1825,88 @@ def _candidate_overlap(a: _TabCandidate, b: _TabCandidate) -> float:
     )
 
 
+def _scale_tab_depth(c: _TabCandidate, ratio: float) -> _TabCandidate:
+    """台形を貼り付け辺に近づけて、奥行きを ``ratio`` 倍に縮める。
+
+    上辺の 2 点を貼り付け辺の両端へ線形に寄せる。奥行きと上辺の逃げ幅が
+    同じ比で縮むので、側面 45 度の台形のまま小さくなる（元の台形に含まれる）。
+    """
+    p0, p1, q1, q0 = c.vertices_2d
+
+    def lerp(p: list[float], q: list[float]) -> list[float]:
+        return [p[0] + ratio * (q[0] - p[0]), p[1] + ratio * (q[1] - p[1])]
+
+    verts = [p0, p1, lerp(p1, q1), lerp(p0, q0)]
+    polygon = Polygon(verts)
+    return _TabCandidate(
+        face_id=c.face_id,
+        neighbor_face_id=c.neighbor_face_id,
+        edge_3d=c.edge_3d,
+        edge_2d=c.edge_2d,
+        vertices_2d=verts,
+        polygon=polygon,
+        bounds=polygon.bounds,
+        area=polygon.area,
+    )
+
+
+def _tab_clear(
+    c: _TabCandidate,
+    obstacles: list[tuple[Polygon, tuple[float, float, float, float], float]],
+) -> bool:
+    """のりしろが障害物（面・他ののりしろ）と重ならないか。"""
+    for poly, bounds, area in obstacles:
+        if _intersection_area(c.polygon, poly, c.bounds, bounds, c.area, area) > 0.0:
+            return False
+    return True
+
+
+def _refine_tab_depths(
+    chosen: list[_TabCandidate],
+    polys: list[Polygon],
+) -> list[_TabCandidate]:
+    """重なっているのりしろの奥行きを、重なりが消えるまで縮める。
+
+    奥行きを縮めた台形は元の台形に含まれるので、重なりは単調に減る。
+    2 分探索で「重ならない最大の奥行き」を探す。1 枚ずつ処理し、後の
+    のりしろは元の大きさで判定する（後で縮むと重なりは減るだけなので、
+    先に決めた側が壊れることはない）。
+
+    下限まで縮めても消えない重なりは、面が角で接しているため置き場所が
+    ない。その場合は縮めず元の大きさのまま返す。
+    """
+    face_obstacles = [(poly, poly.bounds, poly.area) for poly in polys]
+
+    result: list[_TabCandidate] = []
+    for i, c in enumerate(chosen):
+        obstacles = [
+            obstacle
+            for face_id, obstacle in enumerate(face_obstacles)
+            if face_id != c.face_id
+        ]
+        obstacles += [(r.polygon, r.bounds, r.area) for r in result]
+        obstacles += [(r.polygon, r.bounds, r.area) for r in chosen[i + 1 :]]
+
+        if _tab_clear(c, obstacles):
+            result.append(c)
+            continue
+
+        smallest = _scale_tab_depth(c, TAB_MIN_SHRINK_RATIO)
+        if not _tab_clear(smallest, obstacles):
+            result.append(c)
+            continue
+
+        lo, hi = TAB_MIN_SHRINK_RATIO, 1.0
+        for _ in range(TAB_SHRINK_ITERS):
+            mid = (lo + hi) / 2.0
+            if _tab_clear(_scale_tab_depth(c, mid), obstacles):
+                lo = mid
+            else:
+                hi = mid
+        result.append(_scale_tab_depth(c, lo))
+    return result
+
+
 def _cost_less(a: float, b: float) -> bool:
     """``a`` が ``b`` より「意味のある差」で小さいか。
 
@@ -1841,15 +1930,18 @@ def _pick_side(costs: list[float]) -> int:
 def _choose_tab_sides(
     candidates: list[list[_TabCandidate]],
     polys: list[Polygon],
-) -> list[_TabCandidate]:
+) -> tuple[list[_TabCandidate], bool]:
     """各共有辺について、重なりが小さくなる側を 1 つ選ぶ。
 
     のりしろ同士・のりしろと面の重なり面積をコストにし、まず貪欲に決めて
     から 1 枚ずつ反転して改善する。``candidates`` の各要素は必ず 2 枚
     （両側）なので、結果は「各辺ちょうど 1 枚」を構造的に満たす。
+
+    戻り値は ``(選んだ候補, 重なりが残っているか)``。重なりが残って
+    いれば、呼び出し側が :func:`_refine_tab_depths` で奥行きを縮める。
     """
     if not candidates:
-        return []
+        return [], False
 
     # 面の外接矩形と面積は何度も引くので先に取る（GEOS 呼び出しを減らす）。
     face_bounds = [poly.bounds for poly in polys]
@@ -1867,45 +1959,62 @@ def _choose_tab_sides(
 
     chosen: list[_TabCandidate] = []
     chosen_idx: list[int] = []
+    pair_overlap = False
     for i, pair in enumerate(candidates):
-        costs = [
-            unary[i][k]
-            + sum(_candidate_overlap(pair[k], chosen[j]) for j in range(len(chosen)))
+        pair_costs = [
+            sum(_candidate_overlap(pair[k], chosen[j]) for j in range(len(chosen)))
             for k in range(len(pair))
         ]
+        costs = [unary[i][k] + pair_costs[k] for k in range(len(pair))]
         # 同コストなら先頭（面番号の小さい側）を選ぶ。出力を決定的にするため。
         k = _pick_side(costs)
+        if pair_costs[k] > 0.0:
+            pair_overlap = True
         chosen.append(pair[k])
         chosen_idx.append(k)
 
-    # 貪欲の後ろで選んだ側が、後から来たのりしろと重なることがある。
-    # 1 枚ずつ反転してコストが下がる限り繰り返す（局所最適）。
-    for _ in range(8):
-        improved = False
-        for i, pair in enumerate(candidates):
-            if len(pair) < 2:
-                continue
-            other_unary = [
-                sum(
-                    _candidate_overlap(pair[k], chosen[j])
-                    for j in range(len(chosen))
-                    if j != i
-                )
-                for k in range(len(pair))
-            ]
-            costs = [unary[i][k] + other_unary[k] for k in range(len(pair))]
-            best = _pick_side(costs)
-            cur = chosen_idx[i]
-            # 意味のある改善があるとき、または同値で先頭側に寄せられるときに
-            # 切り替える。同値判定に相対トレランスを使うので、拡大・縮小しても
-            # 選ぶ側が変わらない。
-            if best != cur and not _cost_less(costs[cur], costs[best]):
-                chosen[i] = pair[best]
-                chosen_idx[i] = best
-                improved = True
-        if not improved:
-            break
-    return chosen
+    face_overlap = any(
+        unary[i][chosen_idx[i]] > 0.0 for i in range(len(chosen))
+    )
+    # のりしろ同士が重なっていなければ、各辺は自分の重なりが最小の側を
+    # 選んでいる。反転しても面との重なりは増えるだけなので、改善しない。
+    if pair_overlap:
+        # 貪欲の後ろで選んだ側が、後から来たのりしろと重なることがある。
+        # 1 枚ずつ反転してコストが下がる限り繰り返す（局所最適）。
+        for _ in range(8):
+            improved = False
+            for i, pair in enumerate(candidates):
+                if len(pair) < 2:
+                    continue
+                other_unary = [
+                    sum(
+                        _candidate_overlap(pair[k], chosen[j])
+                        for j in range(len(chosen))
+                        if j != i
+                    )
+                    for k in range(len(pair))
+                ]
+                costs = [unary[i][k] + other_unary[k] for k in range(len(pair))]
+                best = _pick_side(costs)
+                cur = chosen_idx[i]
+                # 意味のある改善があるとき、または同値で先頭側に寄せられるときに
+                # 切り替える。同値判定に相対トレランスを使うので、拡大・縮小しても
+                # 選ぶ側が変わらない。
+                if best != cur and not _cost_less(costs[cur], costs[best]):
+                    chosen[i] = pair[best]
+                    chosen_idx[i] = best
+                    improved = True
+            if not improved:
+                break
+        face_overlap = any(
+            unary[i][chosen_idx[i]] > 0.0 for i in range(len(chosen))
+        )
+        pair_overlap = any(
+            _candidate_overlap(chosen[i], chosen[j]) > 0.0
+            for i in range(len(chosen))
+            for j in range(i + 1, len(chosen))
+        )
+    return chosen, face_overlap or pair_overlap
 
 
 def glue_tabs(
@@ -1925,6 +2034,10 @@ def glue_tabs(
     のりしろは面のポリゴンには含めない。したがって ``net_metrics`` の
     外周長・外接矩形・折る回数は、のりしろを付ける前と同じ値になる
     （仕様では折る回数からのりしろを無視する）。
+
+    のりしろ同士が重なる場合は、重なりが消えるまで奥行きを縮める
+    （:func:`_refine_tab_depths`）。面が角で接していて、どちら側にも
+    置き場所がない展開図では、重なりを完全には消せない。
     """
     n_faces = len(faces)
     tree_pairs = {frozenset(edge) for edge in tree_edges}
@@ -1957,6 +2070,9 @@ def glue_tabs(
             )
         candidates.append(sides)
 
+    chosen, has_overlap = _choose_tab_sides(candidates, polys)
+    if has_overlap:
+        chosen = _refine_tab_depths(chosen, polys)
     return [
         GlueTab(
             face_id=c.face_id,
@@ -1965,7 +2081,7 @@ def glue_tabs(
             edge_2d=c.edge_2d,
             vertices_2d=c.vertices_2d,
         )
-        for c in _choose_tab_sides(candidates, polys)
+        for c in chosen
     ]
 
 
