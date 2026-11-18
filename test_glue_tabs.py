@@ -284,6 +284,103 @@ def test_face_overlap_alone_does_not_shrink_tabs():
     assert depth == pytest.approx(fifth.TAB_DEPTH_RATIO * length)
 
 
+def test_tab_size_controls_depth():
+    """TabSize の最大奥行き比が、実際の台形の奥行きを決めること。"""
+    vertices, faces = make_nets.box(1, 1, 1)
+    tree, polys = net_test_cache.unique_nets(vertices, faces)[0]
+    pair_to_edge = fifth._pair_to_edge(faces)
+
+    def max_depth_ratio(size):
+        tabs = fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices, size)
+        ratios = []
+        for tab in tabs:
+            length = math.dist(*tab.edge_2d)
+            p0, _p1, _q1, q0 = tab.vertices_2d
+            # 台形の脚の長さ。貼り付け辺に対する比なら、奥行き比と比例する。
+            leg = math.hypot(q0[0] - p0[0], q0[1] - p0[1])
+            ratios.append(leg / length)
+        return max(ratios)
+
+    # 傾き方は共通なので、脚の長さの比がそのまま奥行き比の比になる。
+    big = max_depth_ratio(fifth.TabSize.of(0, 0.25))
+    small = max_depth_ratio(fifth.TabSize.of(0, 0.1))
+    assert big > small
+    assert small / big == pytest.approx(0.1 / 0.25, rel=1e-6)
+
+
+def _candidate(
+    base_area: float,
+    effective_area: float,
+    *,
+    overlap_count: int = 0,
+    overlap_area: float = 0.0,
+):
+    """順位付けだけを検証するための軽い NetCandidate。"""
+    side = math.sqrt(base_area)
+    eff_side = math.sqrt(effective_area)
+    return fifth.NetCandidate(
+        metrics=fifth.NetMetrics(side, side, base_area, 0.0, 0),
+        layout=fifth.TabLayout(
+            (), overlap_count, overlap_area, (0.0, 0.0, eff_side, eff_side)
+        ),
+        tree=[],
+        polys=[],
+    )
+
+
+def test_net_rank_key_prefers_clean_then_effective_bbox():
+    """重なり0を最優先し、次に実効 bbox 面積で並べること。"""
+    overlapping = _candidate(24, 24, overlap_count=1, overlap_area=0.375)
+    clean_worse_effective = _candidate(28, 33.0)
+    clean_better_effective = _candidate(30, 31.25)
+    ranked = sorted(
+        [overlapping, clean_worse_effective, clean_better_effective],
+        key=lambda c: fifth.net_rank_key(c, "area"),
+    )
+    assert ranked == [clean_better_effective, clean_worse_effective, overlapping]
+
+
+@pytest.mark.slow
+def test_select_nets_with_tabs_prefers_clean_nets():
+    """L 字柱では、糊代ありの選択が面との重なり0の展開図を上位に出すこと。"""
+    vertices, faces = make_nets.l_shape()
+    selection = fifth.select_nets(
+        vertices,
+        faces,
+        fifth.NetSelectionOptions(top_n=3, tab_size=fifth.TabSize.of(0, 0.25)),
+    )
+    assert selection.total_unique_nets == 1516
+    assert len(selection.nets) == 3
+    for candidate in selection.nets:
+        assert candidate.layout.overlap_count == 0
+        assert candidate.tabs
+
+    # 糊代なし（既定）なら旧来どおり面積最小のnetが選ばれる。
+    legacy = fifth.select_nets(vertices, faces, fifth.NetSelectionOptions(top_n=1))
+    assert legacy.nets[0].metrics.bounding_box_area == 24
+    assert legacy.nets[0].tabs == ()
+
+
+@pytest.mark.slow
+def test_select_nets_with_tabs_is_scale_invariant():
+    """糊代込みの選択が、スケールを変えても同じ展開図を選ぶこと。"""
+
+    def keys(scale):
+        vertices, faces = make_nets.l_shape()
+        vertices = vertices.astype(float) * scale
+        selection = fifth.select_nets(
+            vertices,
+            faces,
+            fifth.NetSelectionOptions(top_n=3, tab_size=fifth.TabSize.of(0, 0.25)),
+        )
+        return [
+            [(tab.face_id, tab.neighbor_face_id) for tab in c.tabs]
+            for c in selection.nets
+        ]
+
+    assert keys(1.0) == keys(1e-6) == keys(1e-9)
+
+
 def test_tab_overlap_threshold_uses_local_area():
     """短い辺ののりしろでも、実重なりを 0 と誤判定しないこと。
 
@@ -322,6 +419,7 @@ def test_api_returns_glue_tabs():
         "faces": faces,
         "top_n": top_n,
         "sort_by": "area",
+        "tab_size_max": 0.25,  # 既定は 0（糊代なし）なので明示的に有効にする
     }
     response = client.post(URL, json=body)
     assert response.status_code == 200, response.text[:400]
@@ -344,27 +442,50 @@ def test_api_returns_glue_tabs():
         assert len(keys) == len(set(keys))
         assert set(keys) == cut
 
-    # JSON のキー名と値が、同じ展開図に対する fifth.glue_tabs の結果と
-    # 完全に一致すること。golden は glue_tabs を除外しているので、
-    # ここで直列化の対応を固定する。
+    # JSON のキー名と値が、選択パイプラインが持つタブと完全に一致すること。
+    # golden は glue_tabs を除外しているので、ここで直列化の対応を固定する。
     oriented = fifth.orient_faces_outward(vertices, faces)
-    normals = fifth.compute_normals(vertices, oriented)
-    shared_of = fifth.build_shared_of(oriented)
-    pair_to_edge = fifth._pair_to_edge(oriented)
-    scored = [
-        (
-            fifth.net_metrics(polys, tree, vertices, oriented, normals, shared_of),
-            tree,
-            polys,
-        )
-        for tree, polys in net_test_cache.unique_nets(vertices, oriented)
-    ]
-    scored.sort(key=lambda s: fifth.metric_sort_key(s[0], "area"))
-
-    expected = [
-        api_server._glue_tabs_json(
-            fifth.glue_tabs(polys, oriented, tree, pair_to_edge, vertices)
-        )
-        for _metrics, tree, polys in scored[:top_n]
-    ]
+    selection = fifth.select_nets(
+        vertices,
+        oriented,
+        fifth.NetSelectionOptions(
+            sort_by="area", top_n=top_n, tab_size=fifth.TabSize.of(0, 0.25)
+        ),
+    )
+    expected = [api_server._glue_tabs_json(list(c.tabs)) for c in selection.nets]
     assert [net["glue_tabs"] for net in payload["nets"]] == expected
+
+
+def test_api_skips_glue_tabs_by_default():
+    """クエリを変えない限り、糊代処理は丸ごとスキップされること。"""
+    vertices, faces = make_nets.box(1, 1, 1)
+    response = client.post(
+        URL,
+        json={
+            "vertices": [[float(c) for c in p] for p in vertices.tolist()],
+            "faces": faces,
+            "top_n": 3,
+        },
+    )
+    assert response.status_code == 200, response.text[:400]
+    assert all(net["glue_tabs"] == [] for net in response.json()["nets"])
+
+
+@pytest.mark.parametrize(
+    ("min_size", "max_size"),
+    [(0.3, 0.2), (-0.1, 0.2), (0.0, 1.1)],
+)
+def test_api_rejects_invalid_tab_size(min_size, max_size):
+    """のりしろの大きさが不正なら 422 の invalid_tab_size になること。"""
+    vertices, faces = make_nets.box(1, 1, 1)
+    response = client.post(
+        URL,
+        json={
+            "vertices": [[float(c) for c in p] for p in vertices.tolist()],
+            "faces": faces,
+            "tab_size_min": min_size,
+            "tab_size_max": max_size,
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "invalid_tab_size"
