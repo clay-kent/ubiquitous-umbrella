@@ -63,12 +63,17 @@ python make_nets.py --solid lshape --top-n 6 --sort-by folds
 python make_nets.py --solid pyr4 --outdir images
 python make_nets.py --solid namacha --top-n 3   # 生茶 525mL ペットボトル（ローポリ近似）
 python make_nets.py --solid namacha_box         # 生茶が入る直方体の箱
+python make_nets.py --review                     # のりしろの目視確認用シートを 1 枚だけ作る
 ```
 
 - `--solid`: `box` / `tetra` / `prism3` / `prism4` / `prism5` / `pyr4` / `pyr5` / `lshape` / `namacha` / `namacha_box` / `cutout`
 - `--top-n`: 保存する枚数（0 で全件、既定 0）
 - `--sort-by`: `area`（外接矩形の面積）/ `perimeter`（外周長）/ `folds`（折る回数）
 - `--outdir`: 保存先ディレクトリ（既定 `nets`）
+- `--review`: 代表立体（box / tetra / prism5 / pyr4 / lshape / namacha_box）の展開図を 1 枚の `review.png` に並べる。個別の PNG より先にこれを見ると、のりしろの付き方を一度で確認できる。
+
+> **のりしろの見え方**: 面は青、のりしろは斜線入りのオレンジで描きます。のりしろは面の**上**に重ねて描くので、面と重なっている箇所も隠れずに確認できます。タイトルの `tabs=N` は、その展開図に付いたのりしろの枚数（= 切れている辺の本数）です。
+> L 字柱などの凹角をもつ立体では、のりしろが別の面と重なる展開図があります。これはのりしろ同士の重なりを縮める処理とは別の制約で、現行仕様では許容しています（後述のテスト `test_face_overlap_alone_does_not_shrink_tabs` を参照）。
 
 > **`--sort-by perimeter` の定義変更（v3 PR3）**
 > 以前は外接矩形の周長 `2*(w+h)` で並べていましたが、現在は API と同じ

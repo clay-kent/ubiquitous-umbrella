@@ -3,6 +3,7 @@
     python make_nets.py                 # 既定の立体（立方体）の一意な展開図を全部描く
     python make_nets.py --solid lshape  # プリセットを指定
     python make_nets.py --solid prism5 --top-n 5 --sort-by perimeter
+    python make_nets.py --review        # のりしろ確認用のレビューシートを 1 枚だけ作る
 
 API サーバー (api_server.py) と同じ fifth.py を呼び出すので、同じ結果になる。
 """
@@ -12,6 +13,8 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.axes import Axes
+from matplotlib.patches import Patch
 from shapely.geometry import Polygon
 
 import fifth
@@ -187,49 +190,131 @@ SOLIDS = {
 }
 
 
-def plot_net(
+def _draw_net(
+    ax: Axes,
     polygons: list[Polygon],
     glue_tabs: list[fifth.GlueTab],
     title: str,
-    filename: str,
 ) -> None:
-    """展開図のポリゴンとのりしろを 2D プロットして保存する。"""
-    _fig, ax = plt.subplots(figsize=(6, 6))
+    """1 枚の展開図を ax に描く。
 
+    のりしろを面の**上**に描くのがポイント。旧描画ではのりしろを先に
+    薄く塗ってから面を重ねていたため、面と重なったのりしろが隠れ、
+    人間が見ても配置を確認できなかった。
+    """
     all_x: list[float] = []
     all_y: list[float] = []
-
-    for tab in glue_tabs:
-        tx = [p[0] for p in tab.vertices_2d] + [tab.vertices_2d[0][0]]
-        ty = [p[1] for p in tab.vertices_2d] + [tab.vertices_2d[0][1]]
-        all_x.extend(tx)
-        all_y.extend(ty)
-        ax.fill(tx, ty, alpha=0.25, fc="orange", ec="darkorange", lw=1)
 
     for idx, poly in enumerate(polygons):
         x, y = poly.exterior.xy
         all_x.extend(x)
         all_y.extend(y)
-        ax.fill(x, y, alpha=0.3, fc="skyblue", ec="blue", lw=2)
+        ax.fill(x, y, fc="#cfe3ff", ec="#1f77b4", lw=1.5, zorder=1)
         ax.text(
             poly.centroid.x,
             poly.centroid.y,
             str(idx),
             ha="center",
             va="center",
-            fontsize=12,
+            fontsize=11,
             weight="bold",
+            zorder=3,
+        )
+
+    for tab in glue_tabs:
+        tx = [p[0] for p in tab.vertices_2d] + [tab.vertices_2d[0][0]]
+        ty = [p[1] for p in tab.vertices_2d] + [tab.vertices_2d[0][1]]
+        all_x.extend(tx)
+        all_y.extend(ty)
+        ax.fill(
+            tx,
+            ty,
+            fc="#ffb347",
+            ec="#d2691e",
+            lw=1.2,
+            alpha=0.85,
+            hatch="//",
+            zorder=2,
         )
 
     ax.set_aspect("equal", "box")
-    ax.set_title(title)
+    ax.set_title(f"{title}  (tabs={len(glue_tabs)})", fontsize=10)
     margin = 0.5
     ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
     ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
-    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.grid(True, linestyle="--", alpha=0.4)
 
+
+LEGEND_HANDLES = [
+    Patch(facecolor="#cfe3ff", edgecolor="#1f77b4", label="face"),
+    Patch(
+        facecolor="#ffb347",
+        edgecolor="#d2691e",
+        hatch="//",
+        label="glue tab",
+    ),
+]
+
+
+def plot_net(
+    polygons: list[Polygon],
+    glue_tabs: list[fifth.GlueTab],
+    title: str,
+    filename: str,
+) -> None:
+    """展開図 1 枚を PNG で保存する。"""
+    _fig, ax = plt.subplots(figsize=(6, 6))
+    _draw_net(ax, polygons, glue_tabs, title)
+    _fig.legend(handles=LEGEND_HANDLES, loc="lower center", ncol=2, frameon=False)
     plt.savefig(filename, bbox_inches="tight", dpi=100)
     plt.close()
+
+
+def _net_for_review(solid: str) -> tuple[str, list[Polygon], list[fifth.GlueTab]]:
+    """レビュー用に、その立体の面積最小の展開図を 1 枚つくる。"""
+    vertices, faces = SOLIDS[solid]()
+    normals = fifth.compute_normals(vertices, faces)
+    edges = fifth.build_adjacency_graph(faces)
+    trees = fifth.enumerate_spanning_trees(edges, len(faces))
+    nets = list(fifth.iter_unique_nets(vertices, faces, trees, normals))
+    shared_of = fifth.build_shared_of(faces)
+    scored = [
+        (
+            fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of),
+            tree,
+            polys,
+        )
+        for tree, polys in nets
+    ]
+    scored.sort(key=lambda s: fifth.metric_sort_key(s[0], "area"))
+    _metrics, tree, polys = scored[0]
+    tabs = fifth.glue_tabs(polys, faces, tree, fifth._pair_to_edge(faces), vertices)
+    return solid, polys, tabs
+
+
+REVIEW_SOLIDS = ["box", "tetra", "prism5", "pyr4", "lshape", "namacha_box"]
+
+
+def plot_review_sheet(
+    entries: list[tuple[str, list[Polygon], list[fifth.GlueTab]]],
+    filename: str,
+) -> None:
+    """代表的な立体の展開図を 1 枚のシートに並べて保存する。
+
+    人間が「のりしろが実際にどう付くか」を一度で確認するための図。
+    """
+    ncols = 3
+    nrows = (len(entries) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows))
+    flat = list(np.asarray(axes).reshape(-1))
+    for ax, (solid, polys, tabs) in zip(flat, entries):
+        _draw_net(ax, polys, tabs, solid)
+    for ax in flat[len(entries) :]:
+        ax.axis("off")
+    fig.legend(handles=LEGEND_HANDLES, loc="lower center", ncol=2, frameon=False)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.savefig(filename, dpi=110)
+    plt.close(fig)
 
 
 def main() -> None:
@@ -257,7 +342,22 @@ def main() -> None:
         default="nets",
         help="画像の保存先ディレクトリ（既定: nets）",
     )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="代表立体の展開図を 1 枚のレビュー用シート (review.png) にまとめて保存する",
+    )
     args = parser.parse_args()
+
+    if args.review:
+        os.makedirs(args.outdir, exist_ok=True)
+        entries = [_net_for_review(solid) for solid in REVIEW_SOLIDS]
+        filename = os.path.join(args.outdir, "review.png")
+        plot_review_sheet(entries, filename)
+        print(f"Saved: {filename}")
+        for solid, _polys, tabs in entries:
+            print(f"  {solid}: のりしろ {len(tabs)} 枚")
+        return
 
     vertices, faces = SOLIDS[args.solid]()
     normals = fifth.compute_normals(vertices, faces)
