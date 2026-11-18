@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import math
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Any, NamedTuple, cast
 
@@ -36,6 +39,55 @@ TAB_MAX_END_INSET_RATIO = 0.45
 # 下限まで縮めても重なりが消えない場合は、その下限の大きさで返す。
 TAB_MIN_SHRINK_RATIO = 0.1
 TAB_SHRINK_ITERS = 12
+
+
+@dataclass(frozen=True)
+class TabSize:
+    """のりしろの大きさ指定。値は貼り付け辺の長さに対する比（スケール不変）。
+
+    ``max_depth == 0`` は「糊代処理そのものをしない」という意味にする。
+    API / CLI の既定値はこれで、既存のクエリはそのまま動く。
+    ``min_depth == 0`` は ``max_depth`` の ``TAB_MIN_SHRINK_RATIO`` 倍
+    （= 従来の下限）を表す略記で、``tab_size_max`` だけを指定しても
+    旧挙動と同じ縮み方をする。
+    """
+
+    min_depth: float
+    max_depth: float
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_depth > 0.0
+
+    @property
+    def shrink_floor(self) -> float:
+        """縮小後の奥行きの下限比（``max_depth`` に対する比）。"""
+        if not self.enabled:
+            return 0.0
+        if self.min_depth > 0.0:
+            return self.min_depth / self.max_depth
+        return TAB_MIN_SHRINK_RATIO
+
+    @staticmethod
+    def disabled() -> TabSize:
+        """糊代処理を丸ごとスキップする指定。"""
+        return TabSize(0.0, 0.0)
+
+    @staticmethod
+    def legacy() -> TabSize:
+        """``TAB_DEPTH_RATIO`` 時代と同じ大きさ（低水準 API の既定）。"""
+        return TabSize(TAB_DEPTH_RATIO * TAB_MIN_SHRINK_RATIO, TAB_DEPTH_RATIO)
+
+    @staticmethod
+    def of(min_depth: float, max_depth: float) -> TabSize:
+        """入力値を検証して ``TabSize`` を作る。不正なら ``ValueError``。"""
+        if not (0.0 <= min_depth <= 1.0 and 0.0 <= max_depth <= 1.0):
+            raise ValueError("のりしろの大きさは 0 以上 1 以下の比で指定してください。")
+        if max_depth == 0.0:
+            return TabSize.disabled()
+        if min_depth > max_depth:
+            raise ValueError("のりしろの最小値は最大値以下にしてください。")
+        return TabSize(min_depth, max_depth)
 
 # 個別化-細分の仕事量上限。これを超えると 422 で失敗させる。
 # 根拠（実測）: どのプリセットでも最大でも 126 程度（prism5）。最も重い
@@ -1719,6 +1771,7 @@ def _make_tab_candidate(
     a: int,
     b: int,
     vertices: np.ndarray,
+    size: TabSize,
 ) -> _TabCandidate:
     """共有辺 ``(a, b)`` を面 ``face_id`` 側に貼る場合の台形を作る。
 
@@ -1754,7 +1807,7 @@ def _make_tab_candidate(
     else:
         ox, oy = -uy, ux
 
-    depth = TAB_DEPTH_RATIO * length
+    depth = size.max_depth * length
     inset = min(TAB_SIDE_SLANT * depth, TAB_MAX_END_INSET_RATIO * length)
 
     # 台形: 貼り付け辺 p0->p1 から外側へ depth 出し、上辺を左右に inset 逃がす。
@@ -1862,6 +1915,7 @@ def _tab_clear(
 
 def _refine_tab_depths(
     chosen: list[_TabCandidate],
+    size: TabSize,
 ) -> list[_TabCandidate]:
     """のりしろ同士が重ならないように、奥行きを縮める。
 
@@ -1884,12 +1938,13 @@ def _refine_tab_depths(
             result.append(c)
             continue
 
-        smallest = _scale_tab_depth(c, TAB_MIN_SHRINK_RATIO)
+        floor = size.shrink_floor
+        smallest = _scale_tab_depth(c, floor)
         if not _tab_clear(smallest, obstacles):
             result.append(smallest)
             continue
 
-        lo, hi = TAB_MIN_SHRINK_RATIO, 1.0
+        lo, hi = floor, 1.0
         for _ in range(TAB_SHRINK_ITERS):
             mid = (lo + hi) / 2.0
             if _tab_clear(_scale_tab_depth(c, mid), obstacles):
@@ -2005,12 +2060,13 @@ def _choose_tab_sides(
     return chosen, pair_overlap
 
 
-def glue_tabs(
+def _glue_tabs_impl(
     polys: list[Polygon],
     faces: list[list[int]],
     tree_edges: list[tuple[int, int]],
     pair_to_edge: dict[frozenset[int], tuple[int, int]],
     vertices: np.ndarray,
+    size: TabSize,
 ) -> list[GlueTab]:
     """展開図の「切れている辺」に、ちょうど片側ずつのりしろを付ける。
 
@@ -2054,13 +2110,14 @@ def glue_tabs(
                     a,
                     b,
                     vertices,
+                    size,
                 )
             )
         candidates.append(sides)
 
     chosen, has_overlap = _choose_tab_sides(candidates, polys)
     if has_overlap:
-        chosen = _refine_tab_depths(chosen)
+        chosen = _refine_tab_depths(chosen, size)
     return [
         GlueTab(
             face_id=c.face_id,
@@ -2071,6 +2128,232 @@ def glue_tabs(
         )
         for c in chosen
     ]
+
+
+def glue_tabs(
+    polys: list[Polygon],
+    faces: list[list[int]],
+    tree_edges: list[tuple[int, int]],
+    pair_to_edge: dict[frozenset[int], tuple[int, int]],
+    vertices: np.ndarray,
+    size: TabSize | None = None,
+) -> list[GlueTab]:
+    """のりしろを付ける低水準 API。
+
+    ``size=None`` のときは旧来の大きさ（``TabSize.legacy()``）を使う。
+    選択パイプラインでは :func:`place_tabs` を通し、そちらでは
+    ``size`` を明示する（既定で糊代なし、クエリから指定する）。
+    """
+    if size is None:
+        size = TabSize.legacy()
+    if not size.enabled:
+        return []
+    return _glue_tabs_impl(polys, faces, tree_edges, pair_to_edge, vertices, size)
+
+
+@dataclass(frozen=True)
+class TabLayout:
+    """1 枚の展開図について、糊代まわりの計算結果を1つにまとめたもの。
+
+    ``bbox`` は面とタブを合わせた**実効外接矩形**。面だけの指標
+    （:class:`NetMetrics`）は変えずに、選択時の再順位付けに使う。
+    """
+
+    tabs: tuple[GlueTab, ...]
+    overlap_count: int
+    overlap_area: float
+    bbox: tuple[float, float, float, float]
+
+    @property
+    def bbox_area(self) -> float:
+        return (self.bbox[2] - self.bbox[0]) * (self.bbox[3] - self.bbox[1])
+
+
+def _bbox_of_polys(polys: Iterable[Polygon]) -> tuple[float, float, float, float]:
+    boxes = [p.bounds for p in polys]
+    return (
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    )
+
+
+def place_tabs(
+    polys: list[Polygon],
+    faces: list[list[int]],
+    tree_edges: list[tuple[int, int]],
+    pair_to_edge: dict[frozenset[int], tuple[int, int]],
+    vertices: np.ndarray,
+    size: TabSize,
+) -> TabLayout:
+    """のりしろ配置・面との重なりスコア・実効 bbox を1回で計算する。
+
+    ``size`` が無効なら、タブ生成も重なり計算もせず面だけの bbox を返す。
+    """
+    x0, y0, x1, y1 = _bbox_of_polys(polys)
+    if not size.enabled:
+        return TabLayout((), 0, 0.0, (x0, y0, x1, y1))
+
+    tabs = _glue_tabs_impl(polys, faces, tree_edges, pair_to_edge, vertices, size)
+    count = 0
+    overlap_area = 0.0
+    for tab in tabs:
+        poly = Polygon(tab.vertices_2d)
+        area_here = 0.0
+        for face_id, face_poly in enumerate(polys):
+            if face_id == tab.face_id:
+                continue
+            area_here += _tab_overlap_area(poly, face_poly)
+        if area_here > 0.0:
+            count += 1
+            overlap_area += area_here
+        for x, y in tab.vertices_2d:
+            x0, y0 = min(x0, x), min(y0, y)
+            x1, y1 = max(x1, x), max(y1, y)
+
+    return TabLayout(tuple(tabs), count, overlap_area, (x0, y0, x1, y1))
+
+
+@dataclass(frozen=True)
+class NetCandidate:
+    """選択パイプラインを流れる1枚の展開図。"""
+
+    metrics: NetMetrics
+    layout: TabLayout
+    tree: list[tuple[int, int]]
+    polys: list[Polygon]
+
+    @property
+    def tabs(self) -> tuple[GlueTab, ...]:
+        return self.layout.tabs
+
+
+@dataclass(frozen=True)
+class NetSelectionOptions:
+    """API / CLI が共有する選択オプション。"""
+
+    sort_by: str = "area"
+    top_n: int = 1
+    tab_size: TabSize = field(default_factory=TabSize.disabled)
+    window_ratio: float = 0.10
+    window_min: int = 30
+
+    def window_size(self, n_nets: int) -> int:
+        """スコアを計算する展開図の枚数。``top_n`` 枚は必ず含む。"""
+        return min(
+            n_nets,
+            max(math.ceil(self.window_ratio * n_nets), self.window_min, self.top_n),
+        )
+
+
+@dataclass(frozen=True)
+class NetSelection:
+    nets: list[NetCandidate]
+    total_unique_nets: int
+
+
+def _base_sort_key(c: NetCandidate, sort_by: str) -> float:
+    """タブを付ける前の指標（ウィンドウを選ぶときのキー）。"""
+    if sort_by == "area":
+        return c.metrics.bounding_box_area
+    if sort_by == "perimeter":
+        return c.metrics.perimeter
+    if sort_by == "folds":
+        return float(c.metrics.fold_count)
+    raise ValueError(f"未知の sort_by: {sort_by}")
+
+
+def _rank_value(value: float, scale: float) -> float:
+    """ノイズのバケットに丸める。``scale`` が 0 なら素の値。"""
+    return float(round(value / (scale * 1e-9))) if scale > 0.0 else value
+
+
+def net_rank_key(
+    c: NetCandidate, sort_by: str, scale: float = 0.0
+) -> tuple[float, ...]:
+    """最終順位のキー。重なり0が最優先、次に指定指標。
+
+    ``area`` だけは面+タブの実効 bbox 面積を使う（再順位付け）。
+    ``perimeter`` / ``folds`` は面だけの従来の指標のまま。
+
+    ``scale`` に立体全体の代表面積を渡すと、面積をその 1e-9 倍の
+    バケットに丸める。``_cost_less`` と同じく、スケールを変えただけの
+    浮動ノイズで同値なnetの順位が入れ替わらないようにするため。
+    同値のときは安定ソートで列挙順を保つ（余計なタイブレークを入れない）。
+    """
+    primary = (
+        c.layout.bbox_area
+        if sort_by == "area"
+        else _base_sort_key(c, sort_by)
+    )
+    return (
+        float(c.layout.overlap_count),
+        _rank_value(c.layout.overlap_area, scale),
+        _rank_value(primary, scale),
+    )
+
+
+def select_nets(
+    vertices: np.ndarray,
+    faces: list[list[int]],
+    options: NetSelectionOptions,
+) -> NetSelection:
+    """一意な展開図を列挙し、タブ込みの指標で上位 ``top_n`` 枚を選ぶ。
+
+    正規形による重複排除は木の同型で行うので、ここでは「一意になった
+    展開図のランキング」だけを担当する。タブのスコア計算はウィンドウ
+    内の枚数だけ行い、選択された展開図は計算済みのタブをそのまま持つ。
+    """
+    normals = compute_normals(vertices, faces)
+    shared_of = build_shared_of(faces)
+    pair_to_edge = _pair_to_edge(faces)
+    edges = build_adjacency_graph(faces)
+    trees = enumerate_spanning_trees(edges, len(faces))
+    nets = list(iter_unique_nets(vertices, faces, trees, normals))
+
+    base = [
+        NetCandidate(
+            metrics=net_metrics(polys, tree, vertices, faces, normals, shared_of),
+            layout=TabLayout((), 0, 0.0, _bbox_of_polys(polys)),
+            tree=tree,
+            polys=polys,
+        )
+        for tree, polys in nets
+    ]
+    # 糊代が無効のときは旧来の素の指標順をそのまま使う（互換性）。
+    # 有効なときだけ、スケールだけが違う入力で窓の Membership が変わらない
+    # ように、代表面積に対する相対バケットで丸める。
+    scale = (
+        max((c.metrics.bounding_box_area for c in base), default=0.0)
+        if options.tab_size.enabled
+        else 0.0
+    )
+    base.sort(key=lambda c: _rank_value(_base_sort_key(c, options.sort_by), scale))
+
+    if options.tab_size.enabled:
+        window = base[: options.window_size(len(base))]
+        pool = [
+            NetCandidate(
+                metrics=c.metrics,
+                layout=place_tabs(
+                    c.polys, faces, c.tree, pair_to_edge, vertices, options.tab_size
+                ),
+                tree=c.tree,
+                polys=c.polys,
+            )
+            for c in window
+        ]
+    else:
+        pool = base
+
+    # sorted は安定なので、キーが同じなら基本指標の順（列挙順）が保たれる。
+    pool.sort(key=lambda c: net_rank_key(c, options.sort_by, scale))
+    # top_n=0 は「全件」（CLI の既定）。ウィンドウも全件になる。
+    return NetSelection(
+        nets=pool[: options.top_n] if options.top_n > 0 else pool,
+        total_unique_nets=len(base),
+    )
 
 
 class FaceGeometry(NamedTuple):

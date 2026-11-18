@@ -271,25 +271,21 @@ def plot_net(
 
 
 def _net_for_review(solid: str) -> tuple[str, list[Polygon], list[fifth.GlueTab]]:
-    """レビュー用に、その立体の面積最小の展開図を 1 枚つくる。"""
+    """レビュー用に、のりしろ付きの代表的な展開図を 1 枚つくる。
+
+    レビューは糊代の付き方を見るためのものなので、既定（糊代なし）ではなく
+    従来の大きさを明示して選ぶ。選択自体は API と同じ ``select_nets``。
+    """
     vertices, faces = SOLIDS[solid]()
-    normals = fifth.compute_normals(vertices, faces)
-    edges = fifth.build_adjacency_graph(faces)
-    trees = fifth.enumerate_spanning_trees(edges, len(faces))
-    nets = list(fifth.iter_unique_nets(vertices, faces, trees, normals))
-    shared_of = fifth.build_shared_of(faces)
-    scored = [
-        (
-            fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of),
-            tree,
-            polys,
-        )
-        for tree, polys in nets
-    ]
-    scored.sort(key=lambda s: fifth.metric_sort_key(s[0], "area"))
-    _metrics, tree, polys = scored[0]
-    tabs = fifth.glue_tabs(polys, faces, tree, fifth._pair_to_edge(faces), vertices)
-    return solid, polys, tabs
+    selection = fifth.select_nets(
+        vertices,
+        faces,
+        fifth.NetSelectionOptions(
+            sort_by="area", top_n=1, tab_size=fifth.TabSize.legacy()
+        ),
+    )
+    candidate = selection.nets[0]
+    return solid, candidate.polys, list(candidate.tabs)
 
 
 REVIEW_SOLIDS = ["box", "tetra", "prism5", "pyr4", "lshape", "namacha_box"]
@@ -347,6 +343,20 @@ def main() -> None:
         action="store_true",
         help="代表立体の展開図を 1 枚のレビュー用シート (review.png) にまとめて保存する",
     )
+    # API のクエリ既定は 0（糊代なし）だが、画像は糊代を見るための道具なので
+    # CLI では従来の大きさを既定にする。解釈は fifth.TabSize に一本化。
+    parser.add_argument(
+        "--tab-size-min",
+        type=float,
+        default=0.0,
+        help="のりしろの最小奥行き比（既定 0 = 最大値の 10%%）",
+    )
+    parser.add_argument(
+        "--tab-size-max",
+        type=float,
+        default=0.25,
+        help="のりしろの最大奥行き比（既定 0.25。0 で糊代なし）",
+    )
     args = parser.parse_args()
 
     if args.review:
@@ -360,36 +370,36 @@ def main() -> None:
         return
 
     vertices, faces = SOLIDS[args.solid]()
-    normals = fifth.compute_normals(vertices, faces)
     edges = fifth.build_adjacency_graph(faces)
     n_trees = fifth.count_spanning_trees(edges, len(faces))
     print(f"立体: {args.solid}  頂点={len(vertices)}  面={len(faces)}")
     print(f"全域木: {n_trees} 通り")
 
-    trees = fifth.enumerate_spanning_trees(edges, len(faces))
-    nets = list(fifth.iter_unique_nets(vertices, faces, trees, normals))
-
-    metrics = []
-    shared_of = fifth.build_shared_of(faces)
-    pair_to_edge = fifth._pair_to_edge(faces)
-    for tree, polys in nets:
-        m = fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of)
-        metrics.append((m, tree, polys))
-    metrics.sort(key=lambda s: fifth.metric_sort_key(s[0], args.sort_by))
-
-    if args.top_n > 0:
-        metrics = metrics[: args.top_n]
+    try:
+        size = fifth.TabSize.of(args.tab_size_min, args.tab_size_max)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    selection = fifth.select_nets(
+        vertices,
+        faces,
+        fifth.NetSelectionOptions(
+            sort_by=args.sort_by,
+            top_n=args.top_n,
+            tab_size=size,
+        ),
+    )
 
     suffix = f"（上位 {args.top_n} 個のみ保存）" if args.top_n else ""
-    print(f"一意な展開図: {len(metrics)} 個{suffix}")
+    print(f"一意な展開図: {selection.total_unique_nets} 個{suffix}")
+    print(f"保存: {len(selection.nets)} 枚")
     os.makedirs(args.outdir, exist_ok=True)
 
-    for idx, (m, tree, polys) in enumerate(metrics, start=1):
+    for idx, candidate in enumerate(selection.nets, start=1):
         filename = os.path.join(args.outdir, f"{args.solid}_net_{idx}.png")
-        tabs = fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
+        m = candidate.metrics
         plot_net(
-            polys,
-            tabs,
+            candidate.polys,
+            list(candidate.tabs),
             f"{args.solid} net {idx}  area={m.bounding_box_area:g}",
             filename,
         )

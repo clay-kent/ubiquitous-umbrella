@@ -143,6 +143,21 @@ class SolidRequest(BaseModel):
     sort_by: Literal["area", "perimeter", "folds"] = Field(
         "area", description="並べ替えの基準（area / perimeter / folds）"
     )
+    # 既定は 0 = 糊代処理なし。既存クエリを一切変えずに後から追加できるように
+    # optional にし、0 を「しない」の意味にする（TabSize が解釈の唯一の場所）。
+    # 範囲チェックは Pydantic の Field ではなく fifth.TabSize.of に一本化する。
+    # こうすると不正値の type が必ず invalid_tab_size になり、クライアントが
+    # 分岐しやすい（Field の ge/le は greater_than_equal 等になって混在する）。
+    tab_size_min: float = Field(
+        0.0,
+        description=(
+            "のりしろの最小奥行き（貼り付け辺長比）。0 なら最大値の 10% を使う。"
+        ),
+    )
+    tab_size_max: float = Field(
+        0.0,
+        description="のりしろの最大奥行き（貼り付け辺長比）。0 なら糊代処理をしない。",
+    )
 
 
 def _face_geometry(
@@ -257,18 +272,31 @@ def calculate_nets(req: SolidRequest) -> dict[str, object]:
                 limit=MAX_SPANNING_TREES,
             )
 
-        all_trees = fifth.enumerate_spanning_trees(edges, n_faces)
-        normals = fifth.compute_normals(vertices, faces)
-        unique = list(fifth.iter_unique_nets(vertices, faces, all_trees, normals))
     except fifth.SolidError as exc:
         # 上の _error(...) は HTTPException で、ValueError ではないので
         # 下の except ValueError に飲まれない。再raise句は不要。
         raise _error(exc.code, str(exc)) from exc
-    except ValueError as exc:
-        raise _error("invalid_solid", str(exc)) from exc
 
-    shared_of = fifth.build_shared_of(faces)
+    try:
+        tab_size = fifth.TabSize.of(req.tab_size_min, req.tab_size_max)
+    except ValueError as exc:
+        raise _error("invalid_tab_size", str(exc)) from exc
+
+    try:
+        selection = fifth.select_nets(
+            vertices,
+            faces,
+            fifth.NetSelectionOptions(
+                sort_by=req.sort_by,
+                top_n=req.top_n,
+                tab_size=tab_size,
+            ),
+        )
+    except fifth.SolidError as exc:
+        # 列挙中の予算超過などは入力/計算量のエラーとして 422 に変換する。
+        raise _error(exc.code, str(exc)) from exc
     pair_to_edge = fifth._pair_to_edge(faces)
+    normals = fifth.compute_normals(vertices, faces)
 
     def metrics_json(m: fifth.NetMetrics) -> dict[str, object]:
         """NamedTuple はそのままだと JSON の配列になるので、応答の形に戻す。
@@ -283,29 +311,22 @@ def calculate_nets(req: SolidRequest) -> dict[str, object]:
             "fold_count": m.fold_count,
         }
 
-    # 指標の計算は fifth.net_metrics に一本化した。ここは JSON の形にするだけ。
-    scored = [
-        (
-            fifth.net_metrics(polys, tree, vertices, faces, normals, shared_of),
-            tree,
-            polys,
-        )
-        for tree, polys in unique
-    ]
-    scored.sort(key=lambda s: fifth.metric_sort_key(s[0], req.sort_by))
-
+    # 選択は fifth.select_nets に一本化した。ここは JSON の形にするだけ。
     selected = []
-    for i, (metrics, tree, polys) in enumerate(scored[: req.top_n]):
+    for i, candidate in enumerate(selection.nets):
         selected.append(
             {
                 "net_id": i + 1,
-                "metrics": metrics_json(metrics),
+                "metrics": metrics_json(candidate.metrics),
                 "faces": _face_geometry(
-                    vertices, faces, normals, tree, polys, pair_to_edge
+                    vertices,
+                    faces,
+                    normals,
+                    candidate.tree,
+                    candidate.polys,
+                    pair_to_edge,
                 ),
-                "glue_tabs": _glue_tabs_json(
-                    fifth.glue_tabs(polys, faces, tree, pair_to_edge, vertices)
-                ),
+                "glue_tabs": _glue_tabs_json(list(candidate.tabs)),
             }
         )
 
@@ -322,7 +343,7 @@ def calculate_nets(req: SolidRequest) -> dict[str, object]:
             "total_area": float(sum(fifth._face_area_3d(vertices, f) for f in faces)),
         },
         "sort_by": req.sort_by,
-        "total_unique_nets": len(scored),
+        "total_unique_nets": selection.total_unique_nets,
         "returned": len(selected),
         "nets": selected,
     }
